@@ -1,68 +1,278 @@
 :root {
-  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
-
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  --color-background: #0a0b24;
+  --color-primary: #5D9CF5;
+  --color-text: #ffffff;
+  --color-text-secondary: rgba(255, 255, 255, 0.7);
+  --color-button: #1e2d4a;
+  --color-button-hover: #2a3b5a;
+  --color-button-dark: #0e3056;
+  --color-button-dark-hover: #164070;
+  --color-glow: rgba(93, 156, 245, 0.3);
 }
 
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-a:hover {
-  color: #535bf2;
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
 }
 
 body {
-  margin: 0;
+  font-family: 'Inter', sans-serif;
+  background-color: var(--color-background);
+  color: var(--color-text);
+  line-height: 1.5;
+  background-image: linear-gradient(rgba(93, 156, 245, 0.05) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(93, 156, 245, 0.05) 1px, transparent 1px);
+  background-size: 60px 60px;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+/* Header Styles */
+.header {
+  padding: 1.5rem 0;
+  border-bottom: 1px solid rgba(93, 156, 245, 0.2);
+}
+
+.header .container {
   display: flex;
-  place-items: center;
-  min-width: 320px;
-  min-height: 100vh;
+  justify-content: space-between;
+  align-items: center;
 }
 
-h1 {
-  font-size: 3.2em;
-  line-height: 1.1;
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 700;
+  font-size: 1.25rem;
+  letter-spacing: 0.05em;
 }
 
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
+.nav-list {
+  display: flex;
+  list-style: none;
+  gap: 2rem;
+  padding-right: 500px;
+}
+
+.nav-list a {
+  color: var(--color-text);
+  text-decoration: none;
+  font-size: 1rem;
+  transition: color 0.2s ease;
+}
+
+.nav-list a:hover {
+  color: var(--color-primary);
+}
+
+.actions {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.search-button, .sign-in-button {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-radius: 9999px;
+  border: none;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.875rem;
   font-weight: 500;
-  font-family: inherit;
-  background-color: #1a1a1a;
   cursor: pointer;
-  transition: border-color 0.25s;
-}
-button:hover {
-  border-color: #646cff;
-}
-button:focus,
-button:focus-visible {
-  outline: 4px auto -webkit-focus-ring-color;
+  transition: background-color 0.2s ease;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color: #213547;
-    background-color: #ffffff;
+.search-button {
+  background-color: white;
+  color: var(--color-background);
+}
+
+.search-button:hover {
+  background-color: rgba(255, 255, 255, 0.9);
+}
+
+.sign-in-button {
+  background-color: transparent;
+  color: var(--color-text);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.sign-in-button:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+/* Hero Section */
+.hero {
+  padding: 5rem 0;
+  text-align: center;
+  position: relative;
+}
+
+.hero-title {
+  font-size: 3.5rem;
+  font-weight: 700;
+  line-height: 1.2;
+  margin-bottom: 3rem;
+  position: relative;
+}
+
+.hero-title::after {
+  content: '';
+  position: absolute;
+  bottom: -2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 60%;
+  height: 4px;
+  background: linear-gradient(90deg, rgba(93, 156, 245, 0) 0%, var(--color-primary) 50%, rgba(93, 156, 245, 0) 100%);
+  box-shadow: 0 0 20px 5px var(--color-glow);
+  border-radius: 2px;
+}
+
+.highlight {
+  color: var(--color-primary);
+}
+
+.search-container {
+  position: relative;
+  max-width: 600px;
+  margin: 0 auto 3rem;
+}
+
+.search-input {
+  width: 100%;
+  padding: 1rem 3rem 1rem 1.5rem;
+  border-radius: 9999px;
+  border: none;
+  font-family: 'Inter', sans-serif;
+  font-size: 1rem;
+  background-color: white;
+  color: #333;
+}
+
+.search-input::placeholder {
+  color: #888;
+}
+
+.search-submit {
+  position: absolute;
+  right: 0.5rem;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: #555;
+  padding: 0.5rem;
+}
+
+.example-queries {
+  background-color: rgba(255, 255, 255, 0.05);
+  border-radius: 1rem;
+  padding: 2rem;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.example-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-bottom: 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+}
+
+.sparkle {
+  font-size: 1.5rem;
+}
+
+.query-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  justify-content: center;
+}
+
+.query-button {
+  background-color: var(--color-button);
+  color: var(--color-text);
+  border: none;
+  border-radius: 9999px;
+  padding: 0.75rem 1.25rem;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+  text-align: center;
+}
+
+.query-button:hover {
+  background-color: var(--color-button-hover);
+}
+
+/* Responsive Styles */
+@media (max-width: 768px) {
+  .header .container {
+      flex-direction: column;
+      gap: 1rem;
   }
-  a:hover {
-    color: #747bff;
+  
+  .nav-list {
+      gap: 1rem;
+      justify-content: left;
   }
-  button {
-    background-color: #f9f9f9;
+  
+  .hero-title {
+      font-size: 2.5rem;
+  }
+  
+  .example-queries {
+      padding: 1.5rem;
+  }
+  
+  .query-button {
+      width: 100%;
   }
 }
+
+@media (max-width: 480px) {
+  .nav-list {
+      flex-direction: column;
+      align-items: center;
+      gap: 0.5rem;
+  }
+  
+  .actions {
+      flex-direction: column;
+      width: 100%;
+  }
+  
+  .search-button, .sign-in-button {
+      width: 100%;
+      justify-content: center;
+  }
+  
+  .hero-title {
+      font-size: 2rem;
+  }
+}
+
+.logo-image {
+  width: 60px;
+  height: auto;
+}
+
+
+
+
