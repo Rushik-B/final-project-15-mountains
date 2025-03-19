@@ -273,6 +273,55 @@ body {
   height: auto;
 }
 
+/* Research Paper Card Styles */
+.research-paper-card {
+  overflow: auto;
+  text-align: left;
+  background-color: white;
+  border-radius: 15px;
+  padding: 30px;
+  box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.1);
+  word-wrap: break-word; /* Ensure long words wrap */
+  overflow-wrap: break-word; /* Break words that are too long to fit */
+  hyphens: auto;
+}
+
+.research-paper-card h1 {
+  font-size: 24px;
+  font-weight: bold;
+  color: #2c3e50;
+}
+
+.research-paper-card .author-date {
+  font-size: 14px;
+  color: #7f8c8d;
+  
+}
+
+.research-paper-card .categories {
+  margin-top: 20px;
+}
+
+.research-paper-card .category {
+  display: inline-block;
+  padding: 5px 10px;
+  margin: 5px;
+  background-color: #3498db;
+  color: white;
+  border-radius: 5px;
+}
+
+.research-paper-card .abstract {
+  margin-top: 20px;
+  font-size: 16px;
+  color: #2c3e50;
+}
+
+.research-paper-card .publisher {
+  font-size: 14px;
+  color: #7f8c8d;
+  margin-top: 20px;
+}
 
 
 
