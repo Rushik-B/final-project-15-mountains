@@ -7,7 +7,11 @@ const ResearchPaperCard = ({
   abstract,
   categories = [],
   publisher = '',
-  badgeText = ''
+  badgeText = '',
+  doi = '10.1002/abc.12345',
+  published = '28/01/2023',
+  source = 'crossref',
+  url = ''
 }) => {
   // Format date to DD/MM/YYYY if provided as a Date object
   const formattedDate = typeof date === 'object' && date instanceof Date
@@ -16,20 +20,13 @@ const ResearchPaperCard = ({
 
   return (
     <div className="research-paper-card">
-      {/* Badge */}
-      {badgeText && (
-        <div className="badge">
-          <span>{badgeText}</span>
-        </div>
-      )}
-      
       {/* Title Section */}
       <h1>{title}</h1>
       
       {/* Author and Date */}
       <div className="author-date">
         <span>{author}</span>
-        {author && date && <span>-</span>}
+        {author && formattedDate && <span> - </span>}
         <span>{formattedDate}</span>
       </div>
       
@@ -41,6 +38,29 @@ const ResearchPaperCard = ({
           </span>
         ))}
       </div>
+      
+      {/* DOI and Publication Info */}
+      <div className="doi-info">
+        <span>DOI: {doi}</span>
+        <span>Published: {published}</span>
+        <span>Source: {source}</span>
+      </div>
+      
+      {/* URL/Link to Paper */}
+      {url && (
+        <div className="paper-url">
+          <a href={url} target="_blank" rel="noopener noreferrer">
+            Access Full Paper ↗
+          </a>
+        </div>
+      )}
+      
+      {/* Badge */}
+      {badgeText && (
+        <div className="badge">
+          {badgeText}
+        </div>
+      )}
       
       {/* Abstract Section */}
       <div className="abstract">
