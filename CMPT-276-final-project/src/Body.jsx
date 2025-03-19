@@ -1,39 +1,39 @@
+import React, { useState } from 'react';
+import PaperDisplay from './PaperDisplay'; // Import PaperDisplay component
+
 export default function Body() {
+  const [showExamples, setShowExamples] = useState(true);
+  const [showCard, setShowCard] = useState(false); // State to control visibility of the card
 
+  const handleSearchClick = () => {
+    setShowExamples(false); // Hide the example queries after clicking search
+    setShowCard(true); // Show the card after search
+  };
 
+  return (
+    <main>
+      <section className="hero">
+        <div className="container">
+          <h1 className="hero-title">
+            Your <span className="highlight">AI-powered</span> lens into<br />
+            checking<br />
+            facts.
+          </h1>
+          
+          <div className="search-container">
+            <input
+              type="text"
+              className="search-input"
+              placeholder="Type a scientific claim or topic to explore :)"
+            />
+            <button className="search-submit" onClick={handleSearchClick}>
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M21 21L16.65 16.65M19 11C19 15.4183 15.4183 19 11 19C6.58172 19 3 15.4183 3 11C3 6.58172 6.58172 3 11 3C15.4183 3 19 6.58172 19 11Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </button>
+          </div>
 
-
-
-
-
-
-
-
-
-
-
-
-
-    
-    return(
-        <main>
-        <section className="hero">
-          <div className="container">
-            <h1 className="hero-title">
-              Your <span className="highlight">AI-powered</span> lens into<br />
-              checking<br />
-              facts.
-            </h1>
-            
-            <div className="search-container">
-              <input type="text" className="search-input" placeholder="Type a scientific claim or topic to explore :)"/>
-              <button className="search-submit">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M21 21L16.65 16.65M19 11C19 15.4183 15.4183 19 11 19C6.58172 19 3 15.4183 3 11C3 6.58172 6.58172 3 11 3C15.4183 3 19 6.58172 19 11Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                </svg>
-              </button>
-            </div>
-
+          {showExamples && (
             <div className="example-queries">
               <h2 className="example-title">
                 <span className="sparkle">✨</span> Try Example Queries <span className="sparkle">✨</span>
@@ -46,8 +46,12 @@ export default function Body() {
                 <button className="query-button">Regular exercise can improve cognitive function and mental health</button>
               </div>
             </div>
-          </div>
-        </section>
-      </main> 
-    )
+          )}
+
+          {/* Conditionally render PaperDisplay */}
+          {showCard && <PaperDisplay />}
+        </div>
+      </section>
+    </main>
+  );
 }
