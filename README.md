@@ -11,13 +11,6 @@ Factify is an innovative real-time fact-checking tool designed to combat misinfo
 - Confidence scoring for fact-checked statements
 - User-friendly interface for quick fact-checking
 
-## Group Members
-
-- Rushik Behal
-- Angad Hundal
-- Gurvir Chahal
-- Yu Wu
-
 ## Technology Stack
 
 - Frontend: Next.js with Material-UI
