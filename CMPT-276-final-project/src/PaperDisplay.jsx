@@ -1,17 +1,54 @@
 import React, { useState, useEffect, useRef } from 'react';
 import ResearchPaperCard from './ResearchPaperCard';
+import MagneticElement from './MagneticElement';
 
 const PaperDisplay = ({ claim }) => {
   const [verificationResult, setVerificationResult] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [showSimplified, setShowSimplified] = useState(false);
+  const [loadingStage, setLoadingStage] = useState("initializing");
+  const [loadingProgress, setLoadingProgress] = useState(0);
   const paperRefs = useRef({});
+  const timerRef = useRef(null);
 
   useEffect(() => {
     // Function to fetch verification results from API
     const fetchVerificationResults = async () => {
       setLoading(true);
+      setLoadingStage("initializing");
+      setLoadingProgress(5);
+      
+      // Simulate the various loading stages with realistic timings
+      const loadingStages = [
+        { stage: "extracting_keywords", progress: 15, time: 2000 },
+        { stage: "searching_openalex", progress: 30, time: 3000 },
+        { stage: "searching_crossref", progress: 40, time: 2000 },
+        { stage: "retrieving_papers", progress: 50, time: 4000 },
+        { stage: "embedding_abstracts", progress: 65, time: 3000 },
+        { stage: "semantic_search", progress: 75, time: 2000 },
+        { stage: "analyzing_evidence", progress: 90, time: 3000 }
+      ];
+      
+      // Setup progressive loading stages
+      let currentStageIndex = 0;
+      
+      const progressThroughStages = () => {
+        if (currentStageIndex < loadingStages.length) {
+          const currentStage = loadingStages[currentStageIndex];
+          setLoadingStage(currentStage.stage);
+          setLoadingProgress(currentStage.progress);
+          
+          timerRef.current = setTimeout(() => {
+            currentStageIndex++;
+            progressThroughStages();
+          }, currentStage.time);
+        }
+      };
+      
+      // Start the loading stage simulation
+      progressThroughStages();
+      
       try {
         const response = await fetch('http://localhost:8080/api/verify_claim', {
           method: 'POST',
@@ -28,18 +65,40 @@ const PaperDisplay = ({ claim }) => {
         }
         
         const data = await response.json();
-        setVerificationResult(data.result);
-        setLoading(false);
+        // Clear any remaining timers
+        if (timerRef.current) {
+          clearTimeout(timerRef.current);
+        }
+        
+        setLoadingStage("completed");
+        setLoadingProgress(100);
+        
+        // Small delay before showing results to ensure user sees 100%
+        setTimeout(() => {
+          setVerificationResult(data.result);
+          setLoading(false);
+        }, 500);
       } catch (err) {
         console.error("Error fetching verification results:", err);
         setError('Failed to verify claim. Please try again.');
         setLoading(false);
+        // Clear any remaining timers
+        if (timerRef.current) {
+          clearTimeout(timerRef.current);
+        }
       }
     };
 
     if (claim) {
       fetchVerificationResults();
     }
+    
+    // Cleanup timers when component unmounts
+    return () => {
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+      }
+    };
   }, [claim]); // Re-fetch when claim changes
 
   // Toggle between detailed and simplified reasoning
@@ -52,6 +111,34 @@ const PaperDisplay = ({ claim }) => {
     const paperRef = paperRefs.current[index];
     if (paperRef) {
       paperRef.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
+  // Get loading stage text
+  const getLoadingStageText = (stage) => {
+    switch(stage) {
+      case "initializing":
+        return "Initializing verification process...";
+      case "extracting_keywords":
+        return "Extracting keywords from your claim...";
+      case "searching_openalex":
+        return "Searching OpenAlex scientific database...";
+      case "searching_crossref":
+        return "Searching CrossRef research papers...";
+      case "retrieving_papers":
+        return "Retrieving relevant research papers...";
+      case "embedding_abstracts":
+        return "Processing research abstracts...";
+      case "semantic_search":
+        return "Finding most relevant scientific evidence...";
+      case "analyzing_evidence":
+        return "Analyzing evidence from academic sources...";
+      case "verifying_claim":
+        return "Evaluating claim against scientific consensus...";
+      case "completed":
+        return "Verification complete, displaying results...";
+      default:
+        return "Processing your request...";
     }
   };
 
@@ -152,8 +239,24 @@ const PaperDisplay = ({ claim }) => {
   // Handle loading and error states
   if (loading) return (
     <div className="loading-container">
-      <div className="loading-spinner"></div>
-      <p>Verifying claim and gathering research evidence...</p>
+      <div className="loading-progress-container">
+        <div 
+          className="loading-progress-bar" 
+          style={{width: `${loadingProgress}%`}}
+        ></div>
+      </div>
+      <div className="loading-stage">
+        <div className="loading-spinner"></div>
+        <p>{getLoadingStageText(loadingStage)}</p>
+        <p className="loading-percentage">{loadingProgress}% complete</p>
+      </div>
+      <div className="loading-info">
+        <p>We're searching through scientific literature to verify your claim.</p>
+        <p className="loading-detail">This process analyzes multiple research papers and typically takes around 10-15 seconds depending on complexity.</p>
+        {loadingStage === "analyzing_evidence" && 
+          <p className="loading-almost-done">Almost done! Our AI is reviewing the evidence and formulating a verdict...</p>
+        }
+      </div>
     </div>
   );
   
@@ -211,32 +314,36 @@ const PaperDisplay = ({ claim }) => {
             </div>
             
             <div className="reasoning-content">
-              <button 
-                className={`simplify-button ${showSimplified ? 'active' : ''}`}
-                onClick={toggleSimplified}
-                aria-label={showSimplified ? "Show Technical Analysis" : "Simplify Summary"}
-                title={showSimplified ? "Show Technical Analysis" : "Simplify Summary"}
-              >
-                {/* SVG icon for simplify/tech toggle */}
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  {showSimplified ? (
-                    // Technical icon (graph-like)
-                    <>
-                      <line x1="3" y1="12" x2="21" y2="12"></line>
-                      <line x1="3" y1="6" x2="21" y2="6"></line>
-                      <line x1="3" y1="18" x2="21" y2="18"></line>
-                    </>
-                  ) : (
-                    // Simplify icon (magic wand-like)
-                    <>
-                      <path d="M18 2l3 3-3 3-3-3 3-3z"></path>
-                      <path d="M16 16l-9-9"></path>
-                      <path d="M11.1 3.6a30 30 0 0 0-6.023 12.521"></path>
-                    </>
-                  )}
-                </svg>
-                <span>{showSimplified ? "Technical" : "Simplify"}</span>
-              </button>
+              <div className="simplify-button-container">
+                <MagneticElement strength={35} distance={80}>
+                  <button 
+                    className={`simplify-button ${showSimplified ? 'active' : ''}`}
+                    onClick={toggleSimplified}
+                    aria-label={showSimplified ? "Show Technical Analysis" : "Simplify Summary"}
+                    title={showSimplified ? "Show Technical Analysis" : "Simplify Summary"}
+                  >
+                    {/* SVG icon for simplify/tech toggle */}
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      {showSimplified ? (
+                        // Technical icon (graph-like)
+                        <>
+                          <line x1="3" y1="12" x2="21" y2="12"></line>
+                          <line x1="3" y1="6" x2="21" y2="6"></line>
+                          <line x1="3" y1="18" x2="21" y2="18"></line>
+                        </>
+                      ) : (
+                        // Simplify icon (magic wand-like)
+                        <>
+                          <path d="M18 2l3 3-3 3-3-3 3-3z"></path>
+                          <path d="M16 16l-9-9"></path>
+                          <path d="M11.1 3.6a30 30 0 0 0-6.023 12.521"></path>
+                        </>
+                      )}
+                    </svg>
+                    <span>{showSimplified ? "Technical" : "Simplify"}</span>
+                  </button>
+                </MagneticElement>
+              </div>
               
               <div className="reasoning-text">
                 {showSimplified 
@@ -313,10 +420,14 @@ const PaperDisplay = ({ claim }) => {
           position: relative;
         }
         
-        .simplify-button {
+        .simplify-button-container {
           position: absolute;
           top: -40px;
           right: 0;
+          z-index: 2;
+        }
+        
+        .simplify-button {
           display: flex;
           align-items: center;
           gap: 6px;
@@ -329,7 +440,6 @@ const PaperDisplay = ({ claim }) => {
           background-color: #f0f5ff;
           border: 1px solid #d1e1ff;
           color: #2563eb;
-          z-index: 2;
           box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
         }
         

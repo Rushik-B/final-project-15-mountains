@@ -44,12 +44,7 @@ app.config.update(
     MAX_EVIDENCE_TO_RETRIEVE=int(os.getenv('MAX_EVIDENCE_TO_RETRIEVE', '200')), # Increased from 20 to 200 per source
     MAX_EVIDENCE_TO_STORE=int(os.getenv('MAX_EVIDENCE_TO_STORE', '400')), # Increased from 50 to 400 total
     RAG_TOP_K=int(os.getenv('RAG_TOP_K', '20')), # Number of chunks for RAG analysis
-    # --- End New Config ---
-    # --- Removed Config (or potentially reused if needed later) ---
-    # MAX_PAPERS_TO_RETRIEVE=int(os.getenv('MAX_PAPERS_TO_RETRIEVE', '200')),
-    # TOP_PAPERS_TO_EVALUATE=int(os.getenv('TOP_PAPERS_TO_EVALUATE', '30')),
-    # CONFIDENCE_THRESHOLD=float(os.getenv('CONFIDENCE_THRESHOLD', '0.7'))
-    # --- End Removed Config ---
+
 )
 
 # Initialize Gemini API
@@ -1226,21 +1221,6 @@ def verify_claim_rag():
         }), 500
     finally:
          db.close() # Ensure session is closed
-
-
-# --- Removed or To Be Reimplemented Endpoints ---
-# @app.route('/api/verification/author/<author_id>/credibility', methods=['GET'])
-# def evaluate_author_credibility(author_id): ... # Needs reimplementation if required
-
-# @app.route('/api/evidence/search', methods=['GET'])
-# def search_evidence(): ... # Replaced by internal retrieval
-
-# @app.route('/api/evidence/work/<work_id>', methods=['GET'])
-# def get_work(work_id): ... # Can be added back to query the local DB
-
-# @app.route('/api/evidence/work/<work_id>/citations', methods=['GET'])
-# def get_citation_timeline(work_id): ... # Needs reimplementation using local data or APIs
-# --- End Removed Endpoints ---
 
 
 # Run the Flask app
