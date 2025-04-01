@@ -1,17 +1,19 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import ResearchPaperCard from './ResearchPaperCard';
 
 const PaperDisplay = ({ claim }) => {
   const [verificationResult, setVerificationResult] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [showSimplified, setShowSimplified] = useState(false);
+  const paperRefs = useRef({});
 
   useEffect(() => {
     // Function to fetch verification results from API
     const fetchVerificationResults = async () => {
       setLoading(true);
       try {
-        const response = await fetch('http://localhost:8080/api/verification/claim', {
+        const response = await fetch('http://localhost:8080/api/verify_claim', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -40,181 +42,249 @@ const PaperDisplay = ({ claim }) => {
     }
   }, [claim]); // Re-fetch when claim changes
 
-  // Calculate total papers analyzed across all sub-claims
-  const calculateTotalPapers = (result) => {
-    if (!result || !result.sub_claims) return 0;
-    return result.sub_claims.reduce((total, subClaim) => 
-      total + (subClaim.evidence_count || 0), 0);
+  // Toggle between detailed and simplified reasoning
+  const toggleSimplified = () => {
+    setShowSimplified(!showSimplified);
   };
 
-  // Extract all papers from all sub-claims and get the top 30 most relevant
-  const getTopRelevantPapers = (result) => {
-    if (!result || !result.sub_claims) return [];
-    
-    // Collect all papers from all sub-claims
-    const allPapers = [];
-    result.sub_claims.forEach(subClaim => {
-      if (subClaim.evidence && subClaim.evidence.length > 0) {
-        allPapers.push(...subClaim.evidence);
-      }
-    });
-    
-    // Remove duplicates based on paper ID
-    const uniquePapers = [];
-    const paperIds = new Set();
-    
-    allPapers.forEach(paper => {
-      if (paper.id && !paperIds.has(paper.id)) {
-        paperIds.add(paper.id);
-        uniquePapers.push(paper);
-      } else if (!paper.id) {
-        // If no ID is available, include the paper anyway
-        uniquePapers.push(paper);
-      }
-    });
-    
-    // Return top 30 (OpenAlex already sorts by relevance)
-    return uniquePapers.slice(0, 30);
+  // Scroll to paper reference when number is clicked
+  const scrollToPaper = (index) => {
+    const paperRef = paperRefs.current[index];
+    if (paperRef) {
+      paperRef.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
   };
 
-  // Gather key findings from all sub-claims
-  const getOverallFindings = (result) => {
-    if (!result || !result.sub_claims) return { supports: [], refutes: [], gaps: [] };
+  // Parse evidence numbers from detailed reasoning and make them clickable
+  const parseDetailedReasoning = (text) => {
+    if (!text) return null;
     
-    const findings = {
-      supports: [],
-      refutes: [],
-      gaps: []
-    };
+    // Regular expression to find the custom evidence chunk references
+    const regex = /\[EVIDENCE_CHUNK:(\d+(?:\s*,\s*\d+)*)\]/g;
+    const parts = [];
+    let lastIndex = 0;
+    let match;
     
-    result.sub_claims.forEach(subClaim => {
-      const evaluation = subClaim.evaluation || {};
-      
-      // Get key support points
-      if (evaluation.key_support_points && evaluation.key_support_points.length > 0) {
-        findings.supports = [...findings.supports, ...evaluation.key_support_points.slice(0, 2)];
+    // Process each match
+    while ((match = regex.exec(text)) !== null) {
+      // Add text before the match
+      if (match.index > lastIndex) {
+        parts.push(text.substring(lastIndex, match.index));
       }
       
-      // Get key refutation points
-      if (evaluation.key_refutation_points && evaluation.key_refutation_points.length > 0) {
-        findings.refutes = [...findings.refutes, ...evaluation.key_refutation_points.slice(0, 2)];
-      }
+      // Extract the numbers string and clean it up
+      const numbersStr = match[1].replace(/\s+/g, '');
+      // Split into individual numbers and filter out any empty strings
+      const numbers = numbersStr.split(',').filter(n => n.length > 0);
       
-      // Get evidence gaps
-      if (evaluation.evidence_gaps && evaluation.evidence_gaps.length > 0) {
-        findings.gaps = [...findings.gaps, ...evaluation.evidence_gaps.slice(0, 2)];
-      }
-    });
+      // Create a wrapper span for the entire evidence group
+      parts.push(
+        <span key={`evidence-group-${match.index}`} className="evidence-group">
+          [
+          {numbers.map((numStr, i) => {
+            const num = parseInt(numStr.trim());
+            if (!isNaN(num)) {
+              return (
+                <React.Fragment key={`evidence-${num}-${i}`}>
+                  <span
+                    className="evidence-link"
+                    onClick={() => scrollToPaper(num - 1)}
+                    title={`Jump to Evidence #${num}`}
+                  >
+                    {num}
+                  </span>
+                  {i < numbers.length - 1 ? ', ' : ''}
+                </React.Fragment>
+              );
+            }
+            return null;
+          })}
+          ]
+        </span>
+      );
+      
+      lastIndex = match.index + match[0].length;
+    }
     
-    // Remove duplicates
-    findings.supports = [...new Set(findings.supports)];
-    findings.refutes = [...new Set(findings.refutes)];
-    findings.gaps = [...new Set(findings.gaps)];
+    // Add any remaining text after the last match
+    if (lastIndex < text.length) {
+      parts.push(text.substring(lastIndex));
+    }
     
-    return findings;
+    return parts;
+  };
+
+  // Get verdict icon based on result
+  const getVerdictIcon = (verdict) => {
+    switch(verdict.toLowerCase()) {
+      case 'supported':
+        return '✅';
+      case 'refuted':
+        return '❌';
+      case 'inconclusive':
+        return '⚠️';
+      default:
+        return '❓';
+    }
+  };
+
+  // Get verdict color class
+  const getVerdictColorClass = (verdict) => {
+    switch(verdict.toLowerCase()) {
+      case 'supported':
+        return 'supported';
+      case 'refuted':
+        return 'refuted';
+      case 'inconclusive':
+      default:
+        return 'inconclusive';
+    }
   };
 
   // Handle loading and error states
-  if (loading) return <div className="loading-indicator">Verifying claim and gathering papers...</div>;
+  if (loading) return (
+    <div className="loading-container">
+      <div className="loading-spinner"></div>
+      <p>Verifying claim and gathering research evidence...</p>
+    </div>
+  );
+  
   if (error) return <div className="error-message">{error}</div>;
   if (!verificationResult) return <div className="no-results">No verification results for "{claim}"</div>;
 
-  const totalPapers = calculateTotalPapers(verificationResult);
-  const findings = getOverallFindings(verificationResult);
-  const topRelevantPapers = getTopRelevantPapers(verificationResult);
-
+  // Format evidence details for display
+  const evidenceDetails = verificationResult.evidence || [];
+  const verdictClass = getVerdictColorClass(verificationResult.verdict);
+  
+  // Get the appropriate reasoning based on simplified state
+  const detailedReasoning = verificationResult.detailed_reasoning || verificationResult.reasoning;
+  const simplifiedReasoning = verificationResult.simplified_reasoning || verificationResult.reasoning;
+  const reasoningToShow = showSimplified ? simplifiedReasoning : detailedReasoning;
+  
   return (
     <div className="verification-results-section">
-      <h2 className="results-title">Verification Results for: "{claim}"</h2>
+      <h2 className="results-title">Verification Results</h2>
       
-      <div className="verdict-summary">
-        <h3>Verdict: <span className={`verdict-${verificationResult.verdict.toLowerCase()}`}>{verificationResult.verdict}</span></h3>
-        <p>Confidence Score: {verificationResult.overall_confidence.toFixed(2)}</p>
-      </div>
-      
-      {/* LLM Text Summary */}
-      {verificationResult.text_summary && (
-        <div className="text-summary">
-          <p>{verificationResult.text_summary}</p>
-          <div className="text-summary-decoration"></div>
+      {/* LLM Summary Card - Enhanced Modern Design */}
+      <div className="llm-summary-card">
+        <div className="claim-text">
+          <span className="quote-mark">"</span>
+          <p>{claim}</p>
+          <span className="quote-mark">"</span>
         </div>
-      )}
-      
-      {/* Research Analysis Summary */}
-      <div className="analysis-summary">
-        <h3>Research Analysis Summary</h3>
         
-        <div className="summary-content">
-          <p className="summary-stat">
-            <span className="stat-value">{verificationResult.sub_claims?.length || 0}</span> sub-claims analyzed from 
-            <span className="stat-value"> {totalPapers}</span> academic papers
-          </p>
-          
-          <div className="summary-findings">
-            {findings.supports.length > 0 && (
-              <div className="finding-group supports">
-                <h4>Key Supporting Evidence:</h4>
-                <ul>
-                  {findings.supports.slice(0, 3).map((point, index) => (
-                    <li key={`support-summary-${index}`}>{point}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            
-            {findings.refutes.length > 0 && (
-              <div className="finding-group refutes">
-                <h4>Key Refuting Evidence:</h4>
-                <ul>
-                  {findings.refutes.slice(0, 3).map((point, index) => (
-                    <li key={`refute-summary-${index}`}>{point}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            
-            {findings.gaps.length > 0 && (
-              <div className="finding-group gaps">
-                <h4>Evidence Gaps:</h4>
-                <ul>
-                  {findings.gaps.slice(0, 3).map((point, index) => (
-                    <li key={`gap-summary-${index}`}>{point}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
+        <div className={`verdict-badge ${verdictClass}`}>
+          <span className="verdict-icon">{getVerdictIcon(verificationResult.verdict)}</span>
+          <span className="verdict-text">{verificationResult.verdict}</span>
+        </div>
+        
+        <div className="confidence-meter">
+          <div className="confidence-label">Confidence</div>
+          <div className="confidence-bar-container">
+            <div 
+              className={`confidence-bar ${verdictClass}`} 
+              style={{width: `${(verificationResult.confidence || 0) * 100}%`}}
+            ></div>
           </div>
-          
-          <p className="summary-conclusion">
-            Based on our analysis of the academic literature, the claim {verificationResult.verdict.toLowerCase() === 'verified' ? 
-              'is supported by substantial evidence' : 
-              verificationResult.verdict.toLowerCase() === 'refuted' ? 
-                'is contradicted by substantial evidence' : 
-                'has insufficient or conflicting evidence'}.
-          </p>
+          <div className="confidence-value">{((verificationResult.confidence || 0) * 100).toFixed(0)}%</div>
+        </div>
+        
+        {/* LLM Reasoning/Summary with Simplify Button */}
+        {reasoningToShow && (
+          <div className="reasoning-container">
+            <div className="reasoning-header">
+              <h3 className="reasoning-title">
+                {showSimplified ? "Simplified Summary" : "Technical Analysis"} 
+                <span className="paper-count-badge">
+                  <span className="count-value">{evidenceDetails.length}</span>
+                  <span className="count-label">papers analyzed</span>
+                </span>
+              </h3>
+            </div>
+            
+            <div className="reasoning-content">
+              <button 
+                className={`simplify-button ${showSimplified ? 'active' : ''}`}
+                onClick={toggleSimplified}
+                aria-label={showSimplified ? "Show Technical Analysis" : "Simplify Summary"}
+                title={showSimplified ? "Show Technical Analysis" : "Simplify Summary"}
+              >
+                {/* SVG icon for simplify/tech toggle */}
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  {showSimplified ? (
+                    // Technical icon (graph-like)
+                    <>
+                      <line x1="3" y1="12" x2="21" y2="12"></line>
+                      <line x1="3" y1="6" x2="21" y2="6"></line>
+                      <line x1="3" y1="18" x2="21" y2="18"></line>
+                    </>
+                  ) : (
+                    // Simplify icon (magic wand-like)
+                    <>
+                      <path d="M18 2l3 3-3 3-3-3 3-3z"></path>
+                      <path d="M16 16l-9-9"></path>
+                      <path d="M11.1 3.6a30 30 0 0 0-6.023 12.521"></path>
+                    </>
+                  )}
+                </svg>
+                <span>{showSimplified ? "Technical" : "Simplify"}</span>
+              </button>
+              
+              <div className="reasoning-text">
+                {showSimplified 
+                  ? simplifiedReasoning
+                  : parseDetailedReasoning(detailedReasoning)}
+              </div>
+            </div>
+          </div>
+        )}
+        
+        {/* Keywords Chips */}
+        {verificationResult.keywords_used && verificationResult.keywords_used.length > 0 && (
+          <div className="keywords-container">
+            <h4 className="keywords-title">Keywords</h4>
+            <div className="keywords-chips">
+              {verificationResult.keywords_used.map((keyword, index) => (
+                <span key={`keyword-${index}`} className="keyword-chip">{keyword}</span>
+              ))}
+            </div>
+          </div>
+        )}
+        
+        {/* Research Category */}
+        <div className="category-tag">
+          <span className="category-icon">🔬</span>
+          <span className="category-text">{verificationResult.category || "Uncategorized"}</span>
         </div>
       </div>
       
-      {/* Top Relevant Papers Section */}
-      <div className="top-relevant-papers-section">
-        <h3>Top 30 Most Relevant Research Papers</h3>
+      {/* Remove the duplicate Research Analysis Summary section */}
+      {/* Instead, add the papers directly */}
+      <div className="top-relevant-papers-section" id="evidence-papers">
+        <h3>Evidence From Research Papers</h3>
         
-        {topRelevantPapers.length > 0 ? (
+        {evidenceDetails.length > 0 ? (
           <div className="papers-container">
-            {topRelevantPapers.map((paper, paperIndex) => (
-              <div key={`paper-${paperIndex}`} className="paper-card-wrapper">
+            {evidenceDetails.map((paper, paperIndex) => (
+              <div 
+                key={`paper-${paperIndex}`} 
+                className="paper-card-wrapper"
+                ref={el => paperRefs.current[paperIndex + 1] = el}
+                id={`paper-${paperIndex + 1}`}
+              >
                 <ResearchPaperCard 
                   title={paper.title || "Untitled Research"}
-                  author={paper.authors ? paper.authors.join(', ') : "Unknown Authors"}
-                  date={paper.publication_date || paper.year || "Unknown Date"}
-                  abstract={paper.abstract || "No abstract provided for this research paper."}
-                  categories={[paper.source || "Academic Source"]}
-                  publisher={paper.source || ""}
-                  badgeText={"Citations: " + (paper.citation_count || 0)}
+                  author={""}
+                  date={paper.pub_date || ""}
+                  abstract={paper.abstract || "No abstract available"}
+                  categories={[]}
+                  publisher={""}
+                  badgeText={`Evidence #${paperIndex + 1}`}
                   doi={paper.doi || ""}
-                  published={paper.publication_date || paper.year || ""}
-                  source={paper.source || ""}
-                  url={paper.url || (paper.doi ? `https://doi.org/${paper.doi}` : "")}
+                  published={paper.pub_date || "Date not available"}
+                  source={paper.source_api || "Unknown source"}
+                  url={paper.link || (paper.doi ? `https://doi.org/${paper.doi}` : "")}
+                  citation_count={paper.citation_count || 0}
                 />
               </div>
             ))}
@@ -224,60 +294,62 @@ const PaperDisplay = ({ claim }) => {
         )}
       </div>
       
-      {/* Sub-claims Analysis without Papers (moved to top relevant papers section) */}
-      {verificationResult.sub_claims && verificationResult.sub_claims.length > 0 && (
-        <div className="sub-claims-section">
-          <h3>Sub-claims Analysis</h3>
-          
-          {verificationResult.sub_claims.map((subClaim, index) => (
-            <div key={`subclaim-${index}`} className="sub-claim-container">
-              <div className="sub-claim-header">
-                <h4>Sub-claim {index + 1}: {subClaim.sub_claim}</h4>
-                
-                <div className="sub-claim-evaluation">
-                  <p className={`stance-${subClaim.evaluation?.stance}`}>
-                    Stance: {subClaim.evaluation?.stance}
-                  </p>
-                  <p>Confidence: {subClaim.evaluation?.confidence_score.toFixed(2)}</p>
-                </div>
-              </div>
-              
-              {subClaim.key_entities && subClaim.key_entities.length > 0 && (
-                <div className="key-entities">
-                  <h5>Key Entities:</h5>
-                  <ul>
-                    {subClaim.key_entities.map((entity, entityIndex) => (
-                      <li key={`entity-${entityIndex}`}>{entity}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              
-              {subClaim.evaluation?.key_support_points && subClaim.evaluation.key_support_points.length > 0 && (
-                <div className="key-points">
-                  <h5>Key Support Points:</h5>
-                  <ul>
-                    {subClaim.evaluation.key_support_points.map((point, pointIndex) => (
-                      <li key={`support-${pointIndex}`}>{point}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              
-              {subClaim.evaluation?.key_refutation_points && subClaim.evaluation.key_refutation_points.length > 0 && (
-                <div className="key-points">
-                  <h5>Key Refutation Points:</h5>
-                  <ul>
-                    {subClaim.evaluation.key_refutation_points.map((point, pointIndex) => (
-                      <li key={`refute-${pointIndex}`}>{point}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
+      {/* Processing Time */}
+      <div className="processing-info">
+        <p>Processing time: {verificationResult.processing_time_seconds.toFixed(2)} seconds</p>
+      </div>
+      
+      <style jsx>{`
+        /* Styling for the simplify button */
+        .reasoning-content {
+          position: relative;
+        }
+        
+        .simplify-button {
+          position: absolute;
+          top: -40px;
+          right: 0;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          padding: 6px 12px;
+          border-radius: 20px;
+          font-size: 0.85rem;
+          font-weight: 500;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          background-color: #f0f5ff;
+          border: 1px solid #d1e1ff;
+          color: #2563eb;
+          z-index: 2;
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+        
+        .simplify-button.active {
+          background-color: #2563eb;
+          color: white;
+          border-color: #2563eb;
+        }
+        
+        .simplify-button:hover {
+          background-color: ${showSimplified ? '#1d4ed8' : '#e0eaff'};
+          border-color: ${showSimplified ? '#1d4ed8' : '#93b4ff'};
+          transform: translateY(-1px);
+          box-shadow: 0 3px 5px rgba(0, 0, 0, 0.15);
+        }
+        
+        .simplify-button svg {
+          transition: all 0.2s ease;
+        }
+        
+        .reasoning-title {
+          margin-bottom: 0;
+        }
+        
+        .reasoning-text {
+          margin-top: 16px;
+        }
+      `}</style>
     </div>
   );
 };
