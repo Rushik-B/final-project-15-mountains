@@ -5,27 +5,31 @@ Factify is a real-time fact-checking tool that verifies claims by retrieving evi
 ## Features
 
 - **Claim Decomposition**: Breaks complex claims into verifiable sub-claims
-- **Evidence Retrieval**: Finds relevant academic papers from OpenAlex
+- **Evidence Retrieval**: Finds relevant academic papers from OpenAlex, CrossRef, and Semantic Scholar
 - **Confidence Scoring**: Evaluates evidence and assigns confidence scores to claims
 - **Citation Timeline**: Tracks how papers' relevance changes over time
 - **Author Credibility**: Assesses academic reputation of sources
-- **Social Context**: Provides explanations about the broader implications of claims
 
 ## Tech Stack
 
 - **Backend Framework**: Flask
 - **External APIs**:
   - OpenAlex API for academic paper retrieval
+  - CrossRef API for additional academic sources
+  - Semantic Scholar API for research papers
   - Google's Gemini API for AI-based analysis
+- **Vector Database**: FAISS for semantic search
+- **Embedding Model**: SentenceTransformer
 
-## Setup Instructions
+## Complete Setup Instructions
 
 ### Prerequisites
 
 - Python 3.9+ installed
-- Google API key for Gemini (or another LLM)
+- Node.js and npm for the frontend
+- Google API key for Gemini
 
-### Installation
+### Backend Setup
 
 1. Clone the repository:
    ```
@@ -35,71 +39,94 @@ Factify is a real-time fact-checking tool that verifies claims by retrieving evi
 
 2. Create a virtual environment and activate it:
    ```
+   cd backend
    python -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
 
-3. Install dependencies:
+3. Install backend dependencies:
    ```
    pip install -r requirements.txt
    ```
 
-4. Create a `.env` file from the example:
+4. Create a `.env` file in the backend directory:
    ```
-   cp .env.example .env
+   touch .env
    ```
 
-5. Edit the `.env` file and add your API keys and configuration.
+5. Add the following configuration to your `.env` file:
+   ```
+# Flask configuration
+SECRET_KEY=rushik-behal
+FLASK_DEBUG=True
+PORT=8080
+
+# Google API configuration for Gemini
+GOOGLE_API_KEY=AIzaSyBaRn2Bxx0gtKJGobs--Jw4zO5Kc5Avb5Q
+
+# OpenAlex configuration
+OPENALEX_EMAIL=rba137@sfu.ca
+
+# Database configuration
+DATABASE_URL=sqlite:///factify_rag.db
+
+# Embedding and RAG configuration
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+MAX_EVIDENCE_TO_RETRIEVE=800
+MAX_EVIDENCE_TO_STORE=800
+RAG_TOP_K=55
+
+# Old config
+MAX_PAPERS_TO_RETRIEVE=600
+TOP_PAPERS_TO_EVALUATE=25
+CONFIDENCE_THRESHOLD=0.75 
+   ```
+
+### Frontend Setup
+
+1. Navigate to the project root directory and install frontend dependencies:
+   ```
+   cd ..  # Return to project root from backend directory
+   npm install
+   ```
 
 ### Running the Application
 
-Run the Flask application:
-```
-python app.py
-```
+1. Start the backend server (from the backend directory):
+   ```
+   cd backend  # Skip if already in backend directory
+   python app.py
+   ```
+   The backend API will be available at `http://localhost:8080`.
 
-The API will be available at `http://localhost:8080`.
+2. In a new terminal, start the frontend development server (from the project root):
+   ```
+   npm run dev
+   ```
+   The frontend will be available at `http://localhost:3000` (or another port if specified).
 
-For production deployment, use Gunicorn:
-```
-gunicorn app:app
-```
+3. Open your browser and navigate to `http://localhost:3000` to use the application.
+
+### Troubleshooting
+
+- **Missing dependencies**: If you encounter missing module errors, try running `pip install -r requirements.txt` again.
+- **CUDA/GPU issues**: The application uses CPU by default. No special configuration is needed for basic usage.
+- **API rate limits**: The application implements rate limiting for external APIs. If you encounter 429 errors, wait a few moments and try again.
+- **Tokenizers warnings**: You may see warnings about tokenizers parallelism. These can be safely ignored or fixed by setting the environment variable `TOKENIZERS_PARALLELISM=false`.
 
 ## API Documentation
 
 ### Health Check
 
 - **GET** `/health`
-  - Returns status of the API
+  - Returns status of the API and its dependencies
 
 ### Claim Verification
 
-- **POST** `/api/verification/claim`
-  - Verifies a claim using academic evidence
+- **POST** `/api/verify_claim`
+  - Verifies a claim using RAG-based academic evidence analysis
   - Request Body: `{ "claim": "Your claim to verify" }`
-
-### Evidence Retrieval
-
-- **GET** `/api/evidence/search`
-  - Searches for academic papers
-  - Query Parameters: 
-    - `query`: Search term
-    - `page` (optional): Page number, default: 1
-    - `per_page` (optional): Results per page, default: 10
-
-- **GET** `/api/evidence/work/{id}`
-  - Retrieves details of a specific paper
-  - Path Parameter: `id`: OpenAlex work ID
-
-- **GET** `/api/evidence/work/{id}/citations`
-  - Retrieves citation timeline for a paper
-  - Path Parameter: `id`: OpenAlex work ID
-
-### Author Credibility
-
-- **GET** `/api/verification/author/{id}/credibility`
-  - Assesses the credibility of an author
-  - Path Parameter: `id`: OpenAlex author ID
+  - Returns verification result, evidence, and confidence score
 
 ## Environment Variables
 
@@ -107,10 +134,9 @@ gunicorn app:app
 - `FLASK_DEBUG`: Set to 'True' for development
 - `GOOGLE_API_KEY`: API key for Google's Gemini
 - `OPENALEX_EMAIL`: Email to use with OpenAlex's polite pool
-- `MAX_PAPERS_TO_RETRIEVE`: Maximum number of papers to retrieve per query
-- `TOP_PAPERS_TO_EVALUATE`: Number of top papers to use for evaluation
-- `CONFIDENCE_THRESHOLD`: Threshold for determining verdict
+- `DATABASE_URL`: Database connection string (default: SQLite)
+- `EMBEDDING_MODEL`: SentenceTransformer model to use (default: all-MiniLM-L6-v2)
+- `MAX_EVIDENCE_TO_RETRIEVE`: Maximum number of papers to retrieve per source
+- `MAX_EVIDENCE_TO_STORE`: Maximum number of total papers to store per query
+- `RAG_TOP_K`: Number of most relevant chunks to use for analysis
 
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.

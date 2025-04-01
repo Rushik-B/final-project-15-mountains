@@ -15,6 +15,10 @@ build/
 venv/
 env/
 .env
+.venv/
+ENV/
+env.bak/
+venv.bak/
 
 # IDE specific files
 .idea/
@@ -30,8 +34,28 @@ logs/
 instance/
 .webassets-cache
 
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
 # MacOS
 .DS_Store
 
 # Windows
-Thumbs.db 
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Pytest
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# Local development settings
+local_settings.py 

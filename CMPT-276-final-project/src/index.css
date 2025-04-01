@@ -21,6 +21,9 @@ body {
   background-color: var(--color-background);
   color: var(--color-text);
   line-height: 1.5;
+}
+
+main {
   background-image: linear-gradient(rgba(93, 156, 245, 0.05) 1px, transparent 1px),
                     linear-gradient(90deg, rgba(93, 156, 245, 0.05) 1px, transparent 1px);
   background-size: 60px 60px;
@@ -613,6 +616,14 @@ body {
   font-size: 1.5rem;
   margin-bottom: 1rem;
   color: var(--color-primary);
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+}
+
+.analysis-summary h3::before {
+  content: "🔍";
+  font-size: 1.2rem;
 }
 
 .summary-content {
@@ -750,6 +761,359 @@ body {
   .text-summary p {
     font-size: 1.1rem;
   }
+}
+
+/* Enhanced LLM Summary Styling */
+.llm-summary-card {
+  background: linear-gradient(135deg, rgba(30, 45, 74, 0.8) 0%, rgba(10, 11, 36, 0.9) 100%);
+  border-radius: 16px;
+  padding: 2rem;
+  margin-bottom: 2rem;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(93, 156, 245, 0.2);
+  backdrop-filter: blur(10px);
+  position: relative;
+  overflow: hidden;
+}
+
+.llm-summary-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--color-primary), rgba(93, 156, 245, 0.3), var(--color-primary));
+  z-index: 1;
+}
+
+.claim-text {
+  position: relative;
+  padding: 0 1.5rem;
+  margin-bottom: 2rem;
+  font-style: italic;
+  color: rgba(255, 255, 255, 0.85);
+  text-align: center;
+}
+
+.claim-text p {
+  font-size: 1.35rem;
+  line-height: 1.5;
+  font-weight: 300;
+  letter-spacing: 0.01em;
+}
+
+.quote-mark {
+  position: absolute;
+  font-size: 3rem;
+  color: rgba(93, 156, 245, 0.3);
+  line-height: 1;
+}
+
+.quote-mark:first-child {
+  top: -0.5rem;
+  left: 0;
+}
+
+.quote-mark:last-child {
+  bottom: -1.5rem;
+  right: 0;
+}
+
+.verdict-badge {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.8rem 1.5rem;
+  border-radius: 8px;
+  margin: 0 auto 1.5rem;
+  width: fit-content;
+  gap: 0.75rem;
+  font-weight: 700;
+  font-size: 1.25rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  box-shadow: 0 5px 15px rgba(0, 0, 0, 0.15);
+}
+
+.verdict-badge.supported {
+  background: linear-gradient(135deg, rgba(40, 160, 100, 0.2) 0%, rgba(40, 160, 100, 0.4) 100%);
+  border: 1px solid rgba(40, 160, 100, 0.5);
+  color: rgb(100, 220, 160);
+}
+
+.verdict-badge.refuted {
+  background: linear-gradient(135deg, rgba(200, 50, 50, 0.2) 0%, rgba(200, 50, 50, 0.4) 100%);
+  border: 1px solid rgba(200, 50, 50, 0.5);
+  color: rgb(255, 120, 120);
+}
+
+.verdict-badge.inconclusive {
+  background: linear-gradient(135deg, rgba(220, 170, 50, 0.2) 0%, rgba(220, 170, 50, 0.4) 100%);
+  border: 1px solid rgba(220, 170, 50, 0.5);
+  color: rgb(255, 200, 100);
+}
+
+.verdict-icon {
+  font-size: 1.5rem;
+}
+
+.confidence-meter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin-bottom: 2rem;
+  padding: 0 1rem;
+}
+
+.confidence-label {
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 0.5rem;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.confidence-bar-container {
+  width: 100%;
+  max-width: 400px;
+  height: 8px;
+  background-color: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 0.5rem;
+}
+
+.confidence-bar {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 1s ease-out;
+}
+
+.confidence-bar.supported {
+  background: linear-gradient(90deg, rgba(40, 160, 100, 0.7), rgb(40, 160, 100));
+}
+
+.confidence-bar.refuted {
+  background: linear-gradient(90deg, rgba(200, 50, 50, 0.7), rgb(200, 50, 50));
+}
+
+.confidence-bar.inconclusive {
+  background: linear-gradient(90deg, rgba(220, 170, 50, 0.7), rgb(220, 170, 50));
+}
+
+.confidence-value {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.reasoning-container {
+  background-color: rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.reasoning-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  color: var(--color-primary);
+}
+
+.reasoning-text {
+  font-size: 1.05rem;
+  line-height: 1.6;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.keywords-container {
+  margin-bottom: 1.5rem;
+}
+
+.keywords-title {
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.75rem;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.keywords-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  margin: 16px auto;
+  width: 100%;
+}
+
+.keyword-chip {
+  background-color: rgba(93, 156, 245, 0.15);
+  border: 1px solid rgba(93, 156, 245, 0.3);
+  border-radius: 20px;
+  padding: 0.4rem 0.8rem;
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.category-tag {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 0.9rem;
+}
+
+.category-icon {
+  font-size: 1.2rem;
+}
+
+.category-text {
+  font-weight: 500;
+}
+
+/* Loading Spinner */
+.loading-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem 0;
+  gap: 1.5rem;
+}
+
+.loading-spinner {
+  width: 50px;
+  height: 50px;
+  border: 3px solid rgba(93, 156, 245, 0.3);
+  border-radius: 50%;
+  border-top-color: var(--color-primary);
+  animation: spin 1s ease-in-out infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Research Evidence Stats - Updated */
+.summary-stats {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, rgba(93, 156, 245, 0.1) 0%, rgba(93, 156, 245, 0.2) 100%);
+  border-radius: 8px;
+  padding: 0.6rem 1.2rem;
+  margin: 0 0 1.5rem;
+  border: 1px solid rgba(93, 156, 245, 0.3);
+}
+
+.stat-value {
+  font-size: 1.8rem;
+  font-weight: 700;
+  color: var(--color-primary);
+  margin-right: 0.5rem;
+}
+
+.stat-label {
+  font-size: 0.9rem;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+/* Responsive Styles */
+@media (max-width: 768px) {
+  .llm-summary-card {
+    padding: 1.5rem;
+  }
+  
+  .claim-text p {
+    font-size: 1.1rem;
+  }
+  
+  .verdict-badge {
+    font-size: 1.1rem;
+    padding: 0.6rem 1.2rem;
+  }
+  
+  .reasoning-text {
+    font-size: 1rem;
+  }
+  
+  .keywords-chips {
+    justify-content: center;
+  }
+}
+
+/* Evidence Group Styling */
+.evidence-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background-color: rgba(93, 156, 245, 0.08);
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: 0 2px;
+  font-family: 'Inter', sans-serif;
+}
+
+.evidence-link {
+  color: var(--color-primary) !important;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s ease;
+  text-decoration: none;
+  padding: 0 2px;
+}
+
+.evidence-link:hover {
+  color: #2563eb !important;
+  transform: translateY(-1px);
+}
+
+/* Paper count badge styling */
+.paper-count-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 12px;
+  padding: 4px 10px;
+  background: linear-gradient(135deg, rgba(93, 156, 245, 0.15) 0%, rgba(93, 156, 245, 0.25) 100%);
+  border-radius: 20px;
+  border: 1px solid rgba(93, 156, 245, 0.3);
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.count-value {
+  font-weight: 700;
+  color: var(--color-primary);
+  margin-right: 5px;
+}
+
+.count-label {
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.reasoning-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.reasoning-title {
+  display: flex;
+  align-items: center;
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 0;
+  color: var(--color-primary);
 }
 
 
