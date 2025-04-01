@@ -69,7 +69,9 @@ const PaperDisplay = ({ claim }) => {
     while ((match = regex.exec(text)) !== null) {
       // Add text before the match
       if (match.index > lastIndex) {
-        parts.push(text.substring(lastIndex, match.index));
+        // Split paragraphs for better readability
+        const textBefore = text.substring(lastIndex, match.index);
+        parts.push(textBefore);
       }
       
       // Extract the numbers string and clean it up
@@ -77,11 +79,16 @@ const PaperDisplay = ({ claim }) => {
       // Split into individual numbers and filter out any empty strings
       const numbers = numbersStr.split(',').filter(n => n.length > 0);
       
+      // Limit the number of evidence links displayed if there are too many
+      const displayLimit = 10;
+      const hasMoreNumbers = numbers.length > displayLimit;
+      const displayNumbers = hasMoreNumbers ? numbers.slice(0, displayLimit) : numbers;
+      
       // Create a wrapper span for the entire evidence group
       parts.push(
         <span key={`evidence-group-${match.index}`} className="evidence-group">
           [
-          {numbers.map((numStr, i) => {
+          {displayNumbers.map((numStr, i) => {
             const num = parseInt(numStr.trim());
             if (!isNaN(num)) {
               return (
@@ -93,12 +100,13 @@ const PaperDisplay = ({ claim }) => {
                   >
                     {num}
                   </span>
-                  {i < numbers.length - 1 ? ', ' : ''}
+                  {i < displayNumbers.length - 1 ? ', ' : ''}
                 </React.Fragment>
               );
             }
             return null;
           })}
+          {hasMoreNumbers && <span className="more-evidence">+{numbers.length - displayLimit} more</span>}
           ]
         </span>
       );

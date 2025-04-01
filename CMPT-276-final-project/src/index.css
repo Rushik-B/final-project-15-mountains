@@ -773,7 +773,10 @@ main {
   border: 1px solid rgba(93, 156, 245, 0.2);
   backdrop-filter: blur(10px);
   position: relative;
-  overflow: hidden;
+  overflow: auto;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  max-width: 100%;
 }
 
 .llm-summary-card::before {
@@ -926,6 +929,10 @@ main {
   font-size: 1.05rem;
   line-height: 1.6;
   color: rgba(255, 255, 255, 0.9);
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  white-space: normal;
+  max-width: 100%;
 }
 
 .keywords-container {
@@ -1047,6 +1054,23 @@ main {
   .keywords-chips {
     justify-content: center;
   }
+  
+  .paper-count-badge {
+    margin-left: 0;
+    margin-top: 5px;
+    margin-bottom: 5px;
+    font-size: 0.8rem;
+  }
+  
+  .reasoning-title {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  
+  .reasoning-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
 }
 
 /* Evidence Group Styling */
@@ -1073,6 +1097,14 @@ main {
 .evidence-link:hover {
   color: #2563eb !important;
   transform: translateY(-1px);
+}
+
+/* Style for showing more evidence indicator */
+.more-evidence {
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.6);
+  margin-left: 3px;
+  font-style: italic;
 }
 
 /* Paper count badge styling */
@@ -1102,6 +1134,7 @@ main {
 
 .reasoning-header {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 10px;
@@ -1109,11 +1142,27 @@ main {
 
 .reasoning-title {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   font-size: 1.1rem;
   font-weight: 600;
   margin-bottom: 0;
   color: var(--color-primary);
+}
+
+/* DOI and Publication Info */
+.doi-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 15px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #7f8c8d;
+}
+
+.doi-info span {
+  display: flex;
+  align-items: center;
 }
 
 
