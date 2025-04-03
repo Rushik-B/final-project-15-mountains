@@ -1,4 +1,6 @@
 import Logo from "./Factify-Logo.jpeg"
+import { Link } from "react-router-dom"
+
 export default function Header() {
     return (
      
@@ -7,14 +9,16 @@ export default function Header() {
         <header className="header">
           <div className="container">
             <div className="logo">
-            <img src={Logo} alt="FACTIFY Logo" className="logo-image" />
+            <Link to="/">
+              <img src={Logo} alt="FACTIFY Logo" className="logo-image" />
+            </Link>
               
             </div>
             <nav className="nav">
               <ul className="nav-list">
                 <li><a href="#features">Features</a></li>
                 <li><a href="#pricing">Pricing</a></li>
-                <li><a href="#contact">Contact</a></li>
+                <li><Link to="/contact">Contact</Link></li>
               </ul>
             </nav>
          

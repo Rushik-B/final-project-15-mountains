@@ -19,6 +19,18 @@ const ResearchPaperCard = ({
     ? `${date.getDate().toString().padStart(2, '0')}/${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getFullYear()}`
     : date;
 
+  // Helper function to get the appropriate CSS class for each source
+  const getSourceClass = (sourceString) => {
+    const sourceLower = sourceString.toLowerCase();
+    
+    if (sourceLower.includes('crossref')) return 'source-crossref';
+    if (sourceLower.includes('openalex')) return 'source-openalex';
+    if (sourceLower.includes('semantic')) return 'source-semantic-scholar';
+    
+    // Default fallback
+    return 'source-default';
+  };
+
   return (
     <div className="research-paper-card">
       {/* Badge */}
@@ -28,8 +40,16 @@ const ResearchPaperCard = ({
         </div>
       )}
       
-      {/* Title Section */}
-      <h1 className="paper-title">{title}</h1>
+      {/* Title Section - Now Clickable */}
+      <h1 className="paper-title">
+        {url ? (
+          <a href={url} target="_blank" rel="noopener noreferrer" className="title-link">
+            {title}
+          </a>
+        ) : (
+          title
+        )}
+      </h1>
       
       {/* Author and Date */}
       <div className="author-date">
@@ -51,11 +71,13 @@ const ResearchPaperCard = ({
       <div className="doi-info">
         <span>DOI: {doi}</span>
         <span>Published: {published}</span>
-        <span>Source: {source}</span>
+        <span className={`source-label ${getSourceClass(source)}`}>
+          Source: {source}
+        </span>
         <span className="citation-count">Citations: {citation_count}</span>
       </div>
       
-      {/* URL/Link to Paper */}
+      {/* URL/Link to Paper - Keeping the existing button */}
       {url && (
         <div className="paper-url">
           <a href={url} target="_blank" rel="noopener noreferrer">
@@ -86,6 +108,25 @@ const ResearchPaperCard = ({
           margin-bottom: 20px;
           background-color: white;
           box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+          transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+          border: 1px solid rgba(0, 0, 0, 0.05);
+          transform: translateZ(0);
+          backface-visibility: hidden;
+        }
+        
+        .research-paper-card:hover {
+          transform: translateY(-5px) translateZ(0);
+          box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1), 0 6px 6px rgba(0, 0, 0, 0.06);
+          border-color: rgba(2, 132, 199, 0.2);
+        }
+        
+        .research-paper-card:hover .badge {
+          background-color: #0369a1;
+          box-shadow: 0 3px 5px rgba(0, 0, 0, 0.2);
+        }
+        
+        .research-paper-card:hover .paper-title {
+          color: #0284c7;
         }
         
         /* Paper title with right padding to avoid badge overlap */
@@ -96,6 +137,38 @@ const ResearchPaperCard = ({
           font-size: 1.4rem;
           line-height: 1.3;
           color: #1f2937;
+        }
+        
+        /* Title link styling */
+        .title-link {
+          color: inherit;
+          text-decoration: none;
+          transition: all 0.2s ease;
+          cursor: pointer;
+          position: relative;
+          display: inline-block;
+        }
+        
+        .title-link:hover {
+          color: #0284c7;
+        }
+        
+        .title-link::after {
+          content: '';
+          position: absolute;
+          width: 100%;
+          height: 2px;
+          bottom: -2px;
+          left: 0;
+          background-color: #0284c7;
+          transform: scaleX(0);
+          transform-origin: bottom right;
+          transition: transform 0.3s ease-out;
+        }
+        
+        .title-link:hover::after {
+          transform: scaleX(1);
+          transform-origin: bottom left;
         }
       
         /* Citation count styling */
@@ -111,6 +184,31 @@ const ResearchPaperCard = ({
           content: '📚';
           margin-right: 4px;
           font-size: 14px;
+        }
+        
+        /* URL link styling */
+        .paper-url {
+          margin: 15px 0;
+        }
+        
+        .paper-url a {
+          display: inline-block;
+          color: #0284c7;
+          font-weight: 500;
+          text-decoration: none;
+          padding: 6px 12px;
+          border-radius: 4px;
+          border: 1px solid #d1e1ff;
+          background-color: #f0f5ff;
+          transition: all 0.2s ease;
+        }
+        
+        .paper-url a:hover {
+          background-color: #0284c7;
+          color: white;
+          border-color: #0284c7;
+          transform: translateY(-2px);
+          box-shadow: 0 4px 8px rgba(2, 132, 199, 0.2);
         }
         
         /* Styling for the toggle button in PaperDisplay */
@@ -196,6 +294,62 @@ const ResearchPaperCard = ({
           font-weight: 600;
           box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
           z-index: 1;
+          transition: all 0.3s ease;
+        }
+        
+        /* Source highlighting with different colors */
+        .source-label {
+          font-weight: 500;
+          border-radius: 4px;
+          padding: 2px 6px;
+          margin-right: 4px;
+          transition: all 0.2s ease;
+        }
+        
+        .source-crossref {
+          background-color: rgba(57, 138, 229, 0.15);
+          color: #2563eb;
+        }
+        
+        .source-openalex {
+          background-color: rgba(16, 185, 129, 0.15);
+          color: #059669;
+        }
+        
+        .source-semantic-scholar {
+          background-color: rgba(139, 92, 246, 0.15);
+          color: #7c3aed;
+        }
+        
+        .source-default {
+          background-color: rgba(107, 114, 128, 0.15);
+          color: #4b5563;
+        }
+        
+        .research-paper-card:hover .source-crossref {
+          background-color: rgba(57, 138, 229, 0.25);
+        }
+        
+        .research-paper-card:hover .source-openalex {
+          background-color: rgba(16, 185, 129, 0.25);
+        }
+        
+        .research-paper-card:hover .source-semantic-scholar {
+          background-color: rgba(139, 92, 246, 0.25);
+        }
+        
+        .research-paper-card:hover .source-default {
+          background-color: rgba(107, 114, 128, 0.25);
+        }
+        
+        @keyframes badgePulse {
+          0% { transform: scale(1); }
+          50% { transform: scale(1.05); }
+          100% { transform: scale(1); }
+        }
+        
+        .research-paper-card:hover .badge {
+          animation: badgePulse 1.5s ease infinite;
         }
       `}</style>
     </div>

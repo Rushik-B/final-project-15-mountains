@@ -134,6 +134,9 @@ class VectorStoreService:
         # Track the current session's embeddings for query-specific search
         self.current_session_indices = []
         self.current_session_study_ids = []
+        # Add a synchronization lock to prevent concurrent batch processing
+        import threading
+        self.embedding_lock = threading.Lock()
 
     def embed_and_store(self, studies):
         """Embeds abstracts and adds them to the FAISS index in batches."""
@@ -155,41 +158,43 @@ class VectorStoreService:
         batch_size = 50  # Adjust based on memory constraints
         total_embedded = 0
         
-        for i in range(0, total_studies, batch_size):
-            batch = studies_with_abstracts[i:i+batch_size]
-            batch_size_actual = len(batch)
-            
-            study_ids = []
-            chunks_to_embed = []
-            
-            for study in batch:
-                study_ids.append(study.id)
-                chunks_to_embed.append(study.abstract)
-            
-            try:
-                logger.info(f"Embedding batch of {batch_size_actual} abstracts (batch {i//batch_size + 1}/{(total_studies-1)//batch_size + 1})...")
-                embeddings = embedding_model.encode(chunks_to_embed, show_progress_bar=False)
-                embeddings_np = np.array(embeddings).astype('float32')
+        # Use lock to prevent concurrent access to FAISS index
+        with self.embedding_lock:
+            for i in range(0, total_studies, batch_size):
+                batch = studies_with_abstracts[i:i+batch_size]
+                batch_size_actual = len(batch)
+                
+                study_ids = []
+                chunks_to_embed = []
+                
+                for study in batch:
+                    study_ids.append(study.id)
+                    chunks_to_embed.append(study.abstract)
+                
+                try:
+                    logger.info(f"Embedding batch of {batch_size_actual} abstracts (batch {i//batch_size + 1}/{(total_studies-1)//batch_size + 1})...")
+                    embeddings = embedding_model.encode(chunks_to_embed, show_progress_bar=False)
+                    embeddings_np = np.array(embeddings).astype('float32')
 
-                # Add embeddings to FAISS index and update map
-                start_index = self.current_pos
-                self.index.add(embeddings_np)
-                
-                for j, study_id in enumerate(study_ids):
-                    self.index_map[start_index + j] = study_id
-                    # Track indices and study IDs for the current session
-                    self.current_session_indices.append(start_index + j)
-                    self.current_session_study_ids.append(study_id)
-                
-                self.current_pos += batch_size_actual
-                total_embedded += batch_size_actual
-                
-                logger.info(f"Successfully embedded batch. Total embedded: {total_embedded}/{total_studies}")
-                
-            except Exception as e:
-                logger.error(f"Error embedding batch: {e}")
-                # Continue with the next batch rather than failing completely
-                
+                    # Add embeddings to FAISS index and update map
+                    start_index = self.current_pos
+                    self.index.add(embeddings_np)
+                    
+                    for j, study_id in enumerate(study_ids):
+                        self.index_map[start_index + j] = study_id
+                        # Track indices and study IDs for the current session
+                        self.current_session_indices.append(start_index + j)
+                        self.current_session_study_ids.append(study_id)
+                    
+                    self.current_pos += batch_size_actual
+                    total_embedded += batch_size_actual
+                    
+                    logger.info(f"Successfully embedded batch. Total embedded: {total_embedded}/{total_studies}")
+                    
+                except Exception as e:
+                    logger.error(f"Error embedding batch: {e}")
+                    # Continue with the next batch rather than failing completely
+            
         logger.info(f"Completed embedding process. Total FAISS index size: {self.index.ntotal}")
         logger.info(f"Current session has {len(self.current_session_indices)} embeddings")
 
@@ -272,44 +277,55 @@ class VectorStoreService:
             # If we have abstracts to embed, create temporary embeddings
             if abstracts_to_embed:
                 logger.info(f"Re-embedding {len(abstracts_to_embed)} abstracts for query-specific search")
-                embeddings = embedding_model.encode(abstracts_to_embed, show_progress_bar=False)
-                embeddings_np = np.array(embeddings).astype('float32')
+                # Use smaller batches for re-embedding to avoid memory issues
+                batch_size = 50  # Smaller batch size
+                all_embeddings = []
                 
-                # Add to temporary index
-                temp_index.add(embeddings_np)
+                for i in range(0, len(abstracts_to_embed), batch_size):
+                    batch = abstracts_to_embed[i:i+batch_size]
+                    batch_embeddings = embedding_model.encode(batch, show_progress_bar=False)
+                    all_embeddings.append(batch_embeddings)
                 
-                # Now search only this temporary index with our claim
-                claim_embedding = embedding_model.encode([claim_text])
-                claim_embedding_np = np.array(claim_embedding).astype('float32')
-                
-                # Search the temporary index
-                temp_top_k = min(top_k, temp_index.ntotal)
-                distances, indices = temp_index.search(claim_embedding_np, temp_top_k)
-                
-                logger.info(f"Performed semantic search on claim-specific pool of {temp_index.ntotal} studies")
-                
-                # Map back to study IDs
-                relevant_study_ids = []
-                for idx in indices[0]:
-                    # Find which study_id corresponds to this position
-                    for study_id, pos in id_to_position.items():
-                        if pos == idx:
-                            relevant_study_ids.append(study_id)
-                            break
-                
-                # Retrieve abstracts from the database
-                if relevant_study_ids:
-                    relevant_studies = self.db.query(Study).filter(Study.id.in_(relevant_study_ids)).all()
-                    study_dict = {s.id: s.abstract for s in relevant_studies if s.abstract}
+                if all_embeddings:
+                    # Combine all batches
+                    combined_embeddings = np.vstack(all_embeddings)
+                    embeddings_np = combined_embeddings.astype('float32')
                     
-                    # Order by relevance
-                    ordered_abstracts = []
-                    for study_id in relevant_study_ids:
-                        if study_id in study_dict:
-                            ordered_abstracts.append(study_dict[study_id])
+                    # Add to temporary index
+                    temp_index.add(embeddings_np)
                     
-                    logger.info(f"Retrieved {len(ordered_abstracts)} most relevant abstracts from query-specific pool")
-                    return ordered_abstracts
+                    # Now search only this temporary index with our claim
+                    claim_embedding = embedding_model.encode([claim_text])
+                    claim_embedding_np = np.array(claim_embedding).astype('float32')
+                    
+                    # Search the temporary index
+                    temp_top_k = min(top_k, temp_index.ntotal)
+                    distances, indices = temp_index.search(claim_embedding_np, temp_top_k)
+                    
+                    logger.info(f"Performed semantic search on claim-specific pool of {temp_index.ntotal} studies")
+                    
+                    # Map back to study IDs
+                    relevant_study_ids = []
+                    for idx in indices[0]:
+                        # Find which study_id corresponds to this position
+                        for study_id, pos in id_to_position.items():
+                            if pos == idx:
+                                relevant_study_ids.append(study_id)
+                                break
+                    
+                    # Retrieve abstracts from the database
+                    if relevant_study_ids:
+                        relevant_studies = self.db.query(Study).filter(Study.id.in_(relevant_study_ids)).all()
+                        study_dict = {s.id: s.abstract for s in relevant_studies if s.abstract}
+                        
+                        # Order by relevance
+                        ordered_abstracts = []
+                        for study_id in relevant_study_ids:
+                            if study_id in study_dict:
+                                ordered_abstracts.append(study_dict[study_id])
+                        
+                        logger.info(f"Retrieved {len(ordered_abstracts)} most relevant abstracts from query-specific pool")
+                        return ordered_abstracts
             
             logger.warning("Could not find relevant abstracts in claim-specific pool")
             return []
@@ -372,7 +388,7 @@ class OpenAlexService:
         params = {
             'search': search_query,
             'per-page': per_page,
-            'filter': 'has_abstract:true,cited_by_count:>5', # Ensure abstracts and >5 citations
+            'filter': 'has_abstract:true,cited_by_count:>50', # Ensure abstracts and >50 citations
             'select': 'id,doi,title,authorships,publication_date,abstract_inverted_index,primary_location,cited_by_count' # Add cited_by_count
         }
         logger.info(f"Querying OpenAlex: {search_query} with per_page={per_page}")
@@ -432,7 +448,7 @@ class OpenAlexService:
             citation_count = paper.get('cited_by_count', 0)
 
             # Only include if citation count > 5
-            if citation_count > 5:
+            if citation_count > 50:
                 processed.append({
                     "doi": paper.get('doi'),
                     "title": paper.get('title', 'Untitled'),
@@ -528,7 +544,7 @@ class CrossRefService:
             citation_count = item.get('is-referenced-by-count', 0)
 
             # Only include if citation count > 5
-            if citation_count > 5:
+            if citation_count > 50:
                 processed.append({
                     "doi": item.get('DOI'),
                     "title": ". ".join(item.get('title', ['Untitled'])),
@@ -632,7 +648,7 @@ class SemanticScholarService:
             citation_count = item.get('citationCount', 0)
 
             # Only include if citation count > 5 (consistent with other sources)
-            if citation_count > 5:
+            if citation_count > 50:
                 processed.append({
                     "doi": doi,
                     "title": item.get('title', 'Untitled'),
@@ -746,21 +762,21 @@ class GeminiService:
 
         Instructions:
         1.  Carefully read the claim and each evidence chunk.
-        2.  Determine whether the evidence, taken as a whole, supports, refutes, or is insufficient to judge the claim.
+        2.  Determine how accurate the claim is based on the available scientific evidence.
         3.  Create TWO different summaries:
             a. First, provide a DETAILED SCIENTIFIC summary (3-5 sentences) that references specific evidence chunks. **Crucially, when referencing evidence chunk numbers (e.g., chunk 5, or chunks 5, 12, and 18), you MUST wrap the reference in the format `[EVIDENCE_CHUNK:NUMBERS]` where NUMBERS is a comma-separated list of the chunk numbers. Example: `... findings from [EVIDENCE_CHUNK:5,12,18] indicate ...` or `... as shown in [EVIDENCE_CHUNK:3] ...`. Do NOT use any other format for referencing chunks.**
-            b. Second, provide a SIMPLIFIED summary (2-3 sentences) in plain language that explains your verdict to a general audience without technical jargon or references to specific evidence chunks.
-        4.  Assign a confidence score between 0.0 (no confidence) and 1.0 (high confidence) to your verdict.
-        5.  Output your verdict as one word: "Supported", "Refuted", or "Inconclusive".
+            b. Second, provide a SIMPLIFIED summary (2-3 sentences) in plain language that explains your assessment to a general audience without technical jargon or references to specific evidence chunks.
+        4.  Assign an ACCURACY SCORE between 0.0 (completely inaccurate) and 1.0 (completely accurate) to the claim. This score should reflect how well the claim is supported by the scientific evidence provided.
+        5.  If you still want to provide a categorical verdict, include it as "Supported", "Partially Supported", "Refuted", or "Inconclusive".
 
-        Return ONLY a JSON object with the keys "verdict", "detailed_reasoning", "simplified_reasoning", and "confidence". Do not include any other text, markdown formatting, or explanations outside the JSON structure.
+        Return ONLY a JSON object with the keys "verdict", "detailed_reasoning", "simplified_reasoning", and "accuracy_score". Do not include any other text, markdown formatting, or explanations outside the JSON structure.
 
         Example Output:
         {{
-            "verdict": "Inconclusive",
-            "detailed_reasoning": "Evidence [EVIDENCE_CHUNK:3,7,12] suggests potential health risks, while [EVIDENCE_CHUNK:5,9,15] indicate possible benefits. Methodological limitations noted in [EVIDENCE_CHUNK:2,8,14] and the need for more controlled trials are emphasized. The contradictory findings and limited long-term studies ([EVIDENCE_CHUNK:4,11]) prevent a definitive conclusion.",
-            "simplified_reasoning": "The research shows mixed results about this claim. Some studies suggest potential risks, while others show possible benefits. Scientists agree that more research is needed before drawing firm conclusions.",
-            "confidence": 0.6
+            "verdict": "Partially Supported",
+            "detailed_reasoning": "Evidence [EVIDENCE_CHUNK:3,7,12] suggests potential health benefits under specific conditions, while [EVIDENCE_CHUNK:5,9,15] indicate possible limitations. Methodological considerations noted in [EVIDENCE_CHUNK:2,8,14] and the need for more controlled trials are emphasized. The research provides moderate support for the claim, but with notable limitations ([EVIDENCE_CHUNK:4,11]).",
+            "simplified_reasoning": "The research provides some support for this claim, but with important limitations. Some studies show potential benefits, while others highlight concerns. Scientists agree that the claim is partially accurate but more research is needed.",
+            "accuracy_score": 0.6
         }}
 
         Now, analyze the claim and evidence provided above.
@@ -778,8 +794,18 @@ class GeminiService:
                 json_str = response_text[json_start:json_end]
                 result = json.loads(json_str)
                  # Validate expected keys
-                if "verdict" in result and ("detailed_reasoning" in result or "reasoning" in result) and "confidence" in result:
-                    logger.info(f"Successfully analyzed claim. Verdict: {result['verdict']}")
+                if "verdict" in result and ("detailed_reasoning" in result or "reasoning" in result) and ("accuracy_score" in result or "confidence" in result):
+                    # Log accuracy score if available
+                    accuracy_message = ""
+                    if "accuracy_score" in result:
+                        accuracy_message = f"Accuracy Score: {result['accuracy_score']}"
+                    elif "confidence" in result:
+                        # For backward compatibility
+                        result["accuracy_score"] = result["confidence"]
+                        accuracy_message = f"Confidence: {result['confidence']}"
+                    
+                    logger.info(f"Successfully analyzed claim. {accuracy_message}")
+                    
                     # Ensure backward compatibility
                     if "reasoning" in result and "detailed_reasoning" not in result:
                         result["detailed_reasoning"] = result["reasoning"]
@@ -796,7 +822,7 @@ class GeminiService:
                      "reasoning": "LLM analysis failed to produce valid JSON output.",
                      "detailed_reasoning": "LLM analysis failed to produce valid JSON output.",
                      "simplified_reasoning": "Analysis failed. Please try again.",
-                     "confidence": 0.0
+                     "accuracy_score": 0.0
                  }
 
         except Exception as e:
@@ -806,7 +832,7 @@ class GeminiService:
                 "reasoning": f"An unexpected error occurred during analysis: {str(e)}",
                 "detailed_reasoning": f"An unexpected error occurred during analysis: {str(e)}",
                 "simplified_reasoning": "An unexpected error occurred during analysis.",
-                "confidence": 0.0
+                "accuracy_score": 0.0
             }
 
 # --- End Gemini Service ---
@@ -1111,14 +1137,14 @@ class RAGVerificationService:
             "reasoning": analysis_result.get("reasoning", "Analysis failed."),
             "detailed_reasoning": analysis_result.get("detailed_reasoning", analysis_result.get("reasoning", "Analysis failed.")),
             "simplified_reasoning": analysis_result.get("simplified_reasoning", analysis_result.get("reasoning", "Analysis failed.")),
-            "confidence": analysis_result.get("confidence", 0.0),
+            "accuracy_score": analysis_result.get("accuracy_score", analysis_result.get("confidence", 0.0)),
             "evidence": evidence_details, # Provide details of evidence used in RAG
             "keywords_used": keywords,
             "category": category,
             "processing_time_seconds": round(time.time() - start_time, 2)
         }
 
-        logger.info(f"RAG verification completed for claim: '{claim}'. Verdict: {final_response['verdict']}")
+        logger.info(f"RAG verification completed for claim: '{claim}'. Accuracy Score: {final_response['accuracy_score']}")
         return final_response
 
 # --- End RAG Verification Service ---
