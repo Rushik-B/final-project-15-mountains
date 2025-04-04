@@ -59,3 +59,4 @@ htmlcov/
 
 # Local development settings
 local_settings.py 
+.vercel
