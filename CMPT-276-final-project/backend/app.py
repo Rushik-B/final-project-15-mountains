@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import logging
 import datetime
 import re  # Add this at the top with other imports
+import socket  # For DNS resolution test
 
 # --- New Imports ---
 import sqlite3
@@ -38,8 +39,8 @@ app.config.update(
     DEBUG=os.getenv('FLASK_DEBUG', 'False') == 'True',
     GOOGLE_API_KEY=os.getenv('GOOGLE_API_KEY'),
     OPENALEX_EMAIL=os.getenv('OPENALEX_EMAIL', 'rba137@sfu.ca'),
-    # --- New Config ---
-    DATABASE_URL=os.getenv('DATABASE_URL', 'sqlite:///factify_rag.db'), # Use SQLite by default
+    # --- Database Config ---
+    DATABASE_URL=os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/postgres'),
     EMBEDDING_MODEL=os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2'),
     MAX_EVIDENCE_TO_RETRIEVE=int(os.getenv('MAX_EVIDENCE_TO_RETRIEVE', '200')), # Increased from 20 to 200 per source
     MAX_EVIDENCE_TO_STORE=int(os.getenv('MAX_EVIDENCE_TO_STORE', '400')), # Increased from 50 to 400 total
@@ -59,8 +60,63 @@ else:
 
 # --- New: Database Setup ---
 Base = declarative_base()
-engine = create_engine(app.config['DATABASE_URL'])
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Log the database URL (without password)
+database_url = app.config['DATABASE_URL']
+logger.info(f"Using database connection: {database_url.split('@')[0].split(':')[0]}:****@{database_url.split('@')[1] if '@' in database_url else 'localhost'}")
+
+# Test DNS resolution for database host
+try:
+    hostname = database_url.split('@')[1].split('/')[0].split(':')[0]
+    logger.info(f"Testing DNS resolution for: {hostname}")
+    resolved_ip = socket.gethostbyname(hostname)
+    logger.info(f"Successfully resolved {hostname} to {resolved_ip}")
+except socket.gaierror as e:
+    logger.error(f"DNS resolution error for {hostname}: {e}")
+    logger.error("Please check your network connection, DNS settings, or if the hostname is correct")
+    # Provide helpful suggestions for Supabase issues
+    if 'supabase.co' in database_url:
+        logger.error("SUPABASE CONNECTION TROUBLESHOOTING:")
+        logger.error("1. Check if your DATABASE_URL is correctly formatted.")
+        logger.error("2. For direct connections, use: postgresql://postgres:password@db.YOUR-PROJECT-REF.supabase.co:5432/postgres")
+        logger.error("3. For pooler connections, use: postgresql://postgres.YOUR-PROJECT-REF:password@aws-0-REGION.pooler.supabase.com:5432/postgres")
+        logger.error("4. Ensure your project reference ID in the connection string is correct.")
+        logger.error("5. Verify your Supabase database is active in the Supabase dashboard.")
+    # Don't exit here, let SQLAlchemy handle the connection error
+
+# Handle potential SSL requirement for PostgreSQL connection
+if database_url.startswith('postgresql'):
+    # Force SSL mode for Supabase connections
+    if 'supabase.co' in database_url:
+        logger.info("Supabase connection detected, setting SSL requirements")
+        if '?' not in database_url:
+            database_url += "?sslmode=require"
+        elif 'sslmode=' not in database_url:
+            database_url += "&sslmode=require"
+        
+try:
+    # Create the engine with more detailed error handling
+    logger.info(f"Creating database engine...")
+    engine = create_engine(
+        database_url, 
+        pool_pre_ping=True,  # Add health checks for connections
+        connect_args={
+            # Longer timeout for slow connections
+            'connect_timeout': 30
+        } if database_url.startswith('postgresql') else {}
+    )
+    
+    # Test the connection
+    logger.info("Testing database connection...")
+    with engine.connect() as connection:
+        # Simple query to test connectivity
+        connection.execute(text("SELECT 1"))
+        logger.info("Database connection test successful!")
+    
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+except Exception as e:
+    logger.error(f"Failed to create database engine or test connection: {e}")
+    raise
 
 class Study(Base):
     __tablename__ = "studies"
@@ -76,21 +132,41 @@ class Study(Base):
     citation_count = Column(Integer, nullable=True, default=0) # Add citation count column
     # relevance_score = Column(Float, nullable=True) # Add if calculated
 
-# Create tables if they don't exist
-Base.metadata.create_all(bind=engine)
+# Create tables if they don't exist (better to use Alembic migrations)
+logger.info("Creating database tables if they don't exist...")
+try:
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created successfully!")
+except Exception as e:
+    logger.error(f"Failed to create database tables: {e}")
+    raise
 
-# Add citation_count column if it doesn't exist
+# Modified to work with both SQLite and PostgreSQL
 def add_column_if_not_exists():
     try:
-        # Get a connection
+        # Get a connection and detect database type
         with engine.connect() as conn:
-            # Check if the column exists
-            result = conn.execute(text("PRAGMA table_info(studies)"))
-            columns = [row[1] for row in result]
-            if 'citation_count' not in columns:
-                logger.info("Adding citation_count column to studies table")
-                conn.execute(text("ALTER TABLE studies ADD COLUMN citation_count INTEGER DEFAULT 0"))
-                conn.commit() # Commit the change
+            dialect = engine.dialect.name
+            logger.info(f"Database dialect detected: {dialect}")
+            
+            if dialect == 'sqlite':
+                # SQLite specific schema check
+                result = conn.execute(text("PRAGMA table_info(studies)"))
+                columns = [row[1] for row in result]
+                if 'citation_count' not in columns:
+                    logger.info("Adding citation_count column to studies table (SQLite)")
+                    conn.execute(text("ALTER TABLE studies ADD COLUMN citation_count INTEGER DEFAULT 0"))
+                    conn.commit()
+            elif dialect == 'postgresql':
+                # PostgreSQL specific schema check
+                try:
+                    # Check if the column exists in PostgreSQL
+                    conn.execute(text("SELECT citation_count FROM studies LIMIT 0"))
+                    logger.info("Citation_count column already exists in studies table (PostgreSQL)")
+                except Exception:
+                    logger.info("Adding citation_count column to studies table (PostgreSQL)")
+                    conn.execute(text("ALTER TABLE studies ADD COLUMN IF NOT EXISTS citation_count INTEGER DEFAULT 0"))
+                    conn.commit()
             logger.info("Database schema check complete")
     except Exception as e:
         logger.error(f"Error checking or updating database schema: {e}")
