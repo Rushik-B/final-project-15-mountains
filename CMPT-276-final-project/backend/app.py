@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 import logging
 import datetime
 import re  # Add this at the top with other imports
-import socket  # For DNS resolution test
 
 # --- New Imports ---
 import sqlite3
@@ -20,7 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
-import gc  # Import garbage collector
+import gc  # Import garbage collector for memory management
 # --- End New Imports ---
 
 # Configure logging
@@ -40,85 +39,35 @@ app.config.update(
     DEBUG=os.getenv('FLASK_DEBUG', 'False') == 'True',
     GOOGLE_API_KEY=os.getenv('GOOGLE_API_KEY'),
     OPENALEX_EMAIL=os.getenv('OPENALEX_EMAIL', 'rba137@sfu.ca'),
-    # --- Database Config ---
-    DATABASE_URL=os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/postgres'),
+    # --- New Config ---
+    DATABASE_URL=os.getenv('DATABASE_URL', 'sqlite:///factify_rag.db'), # Use SQLite by default
     EMBEDDING_MODEL=os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2'),
-    MAX_EVIDENCE_TO_RETRIEVE=int(os.getenv('MAX_EVIDENCE_TO_RETRIEVE', '100')), # Reduced from 200 to 100 per source
-    MAX_EVIDENCE_TO_STORE=int(os.getenv('MAX_EVIDENCE_TO_STORE', '200')), # Reduced from 400 to 200 total
-    RAG_TOP_K=int(os.getenv('RAG_TOP_K', '10')), # Reduced from 20 to 10 to conserve memory
-    BATCH_SIZE=int(os.getenv('BATCH_SIZE', '10')), # Added configurable batch size, reduced from 20
-    LOW_MEMORY_MODE=os.getenv('LOW_MEMORY_MODE', 'True') == 'True' # Added low memory mode flag
+    MAX_EVIDENCE_TO_RETRIEVE=int(os.getenv('MAX_EVIDENCE_TO_RETRIEVE', '50')), # Reduced from 200 to 50 per source
+    MAX_EVIDENCE_TO_STORE=int(os.getenv('MAX_EVIDENCE_TO_STORE', '100')), # Reduced from 400 to 100 total
+    RAG_TOP_K=int(os.getenv('RAG_TOP_K', '10')), # Reduced from 20 to 10 for memory efficiency
+    EMBEDDING_BATCH_SIZE=int(os.getenv('EMBEDDING_BATCH_SIZE', '5')), # Smaller batch size for embeddings
+    LOW_MEMORY_MODE=os.getenv('LOW_MEMORY_MODE', 'True') == 'True'  # Enable low memory mode by default
 )
 
 # Initialize Gemini API
 gemini_api_key = app.config.get('GOOGLE_API_KEY')
 if gemini_api_key:
-    genai.configure(api_key=gemini_api_key)
-
-    gemini_model = genai.GenerativeModel('gemini-2.0-flash') # Using 2.0 Flash as the model.
+    try:
+        genai.configure(api_key=gemini_api_key)
+        # Don't initialize the model here, do it lazily when needed
+        gemini_model = None
+        logger.info("Gemini API configured successfully, model will be loaded when needed")
+    except Exception as e:
+        logger.error(f"Failed to configure Gemini API: {e}")
+        gemini_model = None
 else:
-    print("WARNING: GOOGLE_API_KEY not set. Gemini features will not work.")
+    logger.warning("GOOGLE_API_KEY not set. Gemini features will not work.")
     gemini_model = None
 
 # --- New: Database Setup ---
 Base = declarative_base()
-
-# Log the database URL (without password)
-database_url = app.config['DATABASE_URL']
-logger.info(f"Using database connection: {database_url.split('@')[0].split(':')[0]}:****@{database_url.split('@')[1] if '@' in database_url else 'localhost'}")
-
-# Test DNS resolution for database host
-try:
-    hostname = database_url.split('@')[1].split('/')[0].split(':')[0]
-    logger.info(f"Testing DNS resolution for: {hostname}")
-    resolved_ip = socket.gethostbyname(hostname)
-    logger.info(f"Successfully resolved {hostname} to {resolved_ip}")
-except socket.gaierror as e:
-    logger.error(f"DNS resolution error for {hostname}: {e}")
-    logger.error("Please check your network connection, DNS settings, or if the hostname is correct")
-    # Provide helpful suggestions for Supabase issues
-    if 'supabase.co' in database_url:
-        logger.error("SUPABASE CONNECTION TROUBLESHOOTING:")
-        logger.error("1. Check if your DATABASE_URL is correctly formatted.")
-        logger.error("2. For direct connections, use: postgresql://postgres:password@db.YOUR-PROJECT-REF.supabase.co:5432/postgres")
-        logger.error("3. For pooler connections, use: postgresql://postgres.YOUR-PROJECT-REF:password@aws-0-REGION.pooler.supabase.com:5432/postgres")
-        logger.error("4. Ensure your project reference ID in the connection string is correct.")
-        logger.error("5. Verify your Supabase database is active in the Supabase dashboard.")
-    # Don't exit here, let SQLAlchemy handle the connection error
-
-# Handle potential SSL requirement for PostgreSQL connection
-if database_url.startswith('postgresql'):
-    # Force SSL mode for Supabase connections
-    if 'supabase.co' in database_url:
-        logger.info("Supabase connection detected, setting SSL requirements")
-        if '?' not in database_url:
-            database_url += "?sslmode=require"
-        elif 'sslmode=' not in database_url:
-            database_url += "&sslmode=require"
-        
-try:
-    # Create the engine with more detailed error handling
-    logger.info(f"Creating database engine...")
-    engine = create_engine(
-        database_url, 
-        pool_pre_ping=True,  # Add health checks for connections
-        connect_args={
-            # Longer timeout for slow connections
-            'connect_timeout': 30
-        } if database_url.startswith('postgresql') else {}
-    )
-    
-    # Test the connection
-    logger.info("Testing database connection...")
-    with engine.connect() as connection:
-        # Simple query to test connectivity
-        connection.execute(text("SELECT 1"))
-        logger.info("Database connection test successful!")
-    
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-except Exception as e:
-    logger.error(f"Failed to create database engine or test connection: {e}")
-    raise
+engine = create_engine(app.config['DATABASE_URL'])
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class Study(Base):
     __tablename__ = "studies"
@@ -134,41 +83,21 @@ class Study(Base):
     citation_count = Column(Integer, nullable=True, default=0) # Add citation count column
     # relevance_score = Column(Float, nullable=True) # Add if calculated
 
-# Create tables if they don't exist (better to use Alembic migrations)
-logger.info("Creating database tables if they don't exist...")
-try:
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables created successfully!")
-except Exception as e:
-    logger.error(f"Failed to create database tables: {e}")
-    raise
+# Create tables if they don't exist
+Base.metadata.create_all(bind=engine)
 
-# Modified to work with both SQLite and PostgreSQL
+# Add citation_count column if it doesn't exist
 def add_column_if_not_exists():
     try:
-        # Get a connection and detect database type
+        # Get a connection
         with engine.connect() as conn:
-            dialect = engine.dialect.name
-            logger.info(f"Database dialect detected: {dialect}")
-            
-            if dialect == 'sqlite':
-                # SQLite specific schema check
-                result = conn.execute(text("PRAGMA table_info(studies)"))
-                columns = [row[1] for row in result]
-                if 'citation_count' not in columns:
-                    logger.info("Adding citation_count column to studies table (SQLite)")
-                    conn.execute(text("ALTER TABLE studies ADD COLUMN citation_count INTEGER DEFAULT 0"))
-                    conn.commit()
-            elif dialect == 'postgresql':
-                # PostgreSQL specific schema check
-                try:
-                    # Check if the column exists in PostgreSQL
-                    conn.execute(text("SELECT citation_count FROM studies LIMIT 0"))
-                    logger.info("Citation_count column already exists in studies table (PostgreSQL)")
-                except Exception:
-                    logger.info("Adding citation_count column to studies table (PostgreSQL)")
-                    conn.execute(text("ALTER TABLE studies ADD COLUMN IF NOT EXISTS citation_count INTEGER DEFAULT 0"))
-                    conn.commit()
+            # Check if the column exists
+            result = conn.execute(text("PRAGMA table_info(studies)"))
+            columns = [row[1] for row in result]
+            if 'citation_count' not in columns:
+                logger.info("Adding citation_count column to studies table")
+                conn.execute(text("ALTER TABLE studies ADD COLUMN citation_count INTEGER DEFAULT 0"))
+                conn.commit() # Commit the change
             logger.info("Database schema check complete")
     except Exception as e:
         logger.error(f"Error checking or updating database schema: {e}")
@@ -187,20 +116,19 @@ def get_db():
 # --- New: Vector Store Setup (In-Memory FAISS) ---
 embedding_model_name = app.config['EMBEDDING_MODEL']
 try:
-    # Load model only when needed, initially set to None
+    # Initially set to None - will be loaded on demand
     embedding_model = None
     embedding_dimension = 384  # Default dimension for all-MiniLM-L6-v2
-    # FAISS index (consider persisting this for larger applications)
+    # FAISS index will be initialized when needed
     index = None
     index_to_study_id_map = {} # Map FAISS index to DB study ID
     current_index_pos = 0
-    logger.info(f"Deferred loading of embedding model {embedding_model_name} until needed")
+    logger.info(f"Configured for deferred loading of embedding model: {embedding_model_name}")
 except Exception as e:
-    logger.error(f"Failed to initialize vector store configuration: {e}")
+    logger.error(f"Failed to initialize vector store setup: {e}")
     embedding_model = None
     index = None
-    embedding_dimension = 0 # Default or handle error state
-
+    embedding_dimension = 0
 
 class VectorStoreService:
     def __init__(self, db_session, faiss_index, index_map):
@@ -214,34 +142,37 @@ class VectorStoreService:
         # Add a synchronization lock to prevent concurrent batch processing
         import threading
         self.embedding_lock = threading.Lock()
-        
-        # Lazy-loading for embedding model
+        # Lazy-loaded embedding model
         self.embedding_model = None
 
     def _ensure_embedding_model(self):
         """Lazily load the embedding model only when needed"""
-        global embedding_model
+        global embedding_model, index, embedding_dimension
+        
         if embedding_model is None:
             logger.info(f"Loading embedding model {embedding_model_name}")
             embedding_model = SentenceTransformer(embedding_model_name)
-            # Create index if it doesn't exist
-            if self.index is None:
-                global index, embedding_dimension
+            
+            # Create FAISS index if it doesn't exist
+            if index is None:
                 # Determine embedding dimension dynamically
                 dummy_embedding = embedding_model.encode(["test"])
                 embedding_dimension = dummy_embedding.shape[1]
                 index = faiss.IndexFlatL2(embedding_dimension)
                 self.index = index
                 logger.info(f"Initialized FAISS index with dimension {embedding_dimension}")
-        self.embedding_model = embedding_model
-        return self.embedding_model
+                
+            # Force garbage collection after model loading
+            gc.collect()
+            
+        return embedding_model
 
     def embed_and_store(self, studies):
         """Embeds abstracts and adds them to the FAISS index in batches."""
-        # Ensure embedding model is loaded
+        # Ensure model is loaded
         self._ensure_embedding_model()
         
-        if not self.embedding_model or not self.index:
+        if embedding_model is None or self.index is None:
             logger.error("Embedding model or FAISS index not available.")
             return
 
@@ -255,8 +186,8 @@ class VectorStoreService:
         total_studies = len(studies_with_abstracts)
         logger.info(f"Preparing to embed {total_studies} abstracts...")
         
-        # Process in smaller batches to reduce memory usage
-        batch_size = app.config['BATCH_SIZE']  # Reduced batch size
+        # Process in much smaller batches to avoid memory issues
+        batch_size = app.config['EMBEDDING_BATCH_SIZE']  # Use much smaller batches (e.g., 5)
         total_embedded = 0
         
         # Use lock to prevent concurrent access to FAISS index
@@ -270,11 +201,13 @@ class VectorStoreService:
                 
                 for study in batch:
                     study_ids.append(study.id)
-                    chunks_to_embed.append(study.abstract)
+                    # Truncate very long abstracts to avoid memory issues
+                    abstract = study.abstract[:5000] if study.abstract and len(study.abstract) > 5000 else study.abstract
+                    chunks_to_embed.append(abstract)
                 
                 try:
                     logger.info(f"Embedding batch of {batch_size_actual} abstracts (batch {i//batch_size + 1}/{(total_studies-1)//batch_size + 1})...")
-                    embeddings = self.embedding_model.encode(chunks_to_embed, show_progress_bar=False)
+                    embeddings = embedding_model.encode(chunks_to_embed, show_progress_bar=False)
                     embeddings_np = np.array(embeddings).astype('float32')
 
                     # Add embeddings to FAISS index and update map
@@ -292,7 +225,8 @@ class VectorStoreService:
                     
                     logger.info(f"Successfully embedded batch. Total embedded: {total_embedded}/{total_studies}")
                     
-                    # Force garbage collection after each batch to free memory
+                    # Clear memory after each batch
+                    del embeddings, embeddings_np, chunks_to_embed
                     gc.collect()
                     
                 except Exception as e:
@@ -301,21 +235,16 @@ class VectorStoreService:
             
         logger.info(f"Completed embedding process. Total FAISS index size: {self.index.ntotal}")
         logger.info(f"Current session has {len(self.current_session_indices)} embeddings")
-        
-        # Clear memory that's no longer needed
-        gc.collect()
+        gc.collect()  # Final cleanup
 
     def retrieve_relevant_chunks(self, claim_text, top_k):
         """Retrieves top_k relevant study abstracts based on claim similarity."""
-        # Ensure embedding model is loaded
-        self._ensure_embedding_model()
-        
-        if not self.embedding_model or not self.index or self.index.ntotal == 0:
+        if not embedding_model or not self.index or self.index.ntotal == 0:
             logger.error("Embedding model, FAISS index not available, or index is empty.")
             return []
 
         try:
-            claim_embedding = self.embedding_model.encode([claim_text])
+            claim_embedding = embedding_model.encode([claim_text])
             claim_embedding_np = np.array(claim_embedding).astype('float32')
 
             logger.info(f"Searching FAISS index (size {self.index.ntotal}) for top {top_k} chunks.")
@@ -342,12 +271,8 @@ class VectorStoreService:
                  if study_id in study_dict:
                      ordered_abstracts.append(study_dict[study_id])
 
+
             logger.info(f"Retrieved {len(ordered_abstracts)} relevant abstracts.")
-            
-            # Clear memory
-            del distances, indices, relevant_study_ids, faiss_ordered_ids
-            gc.collect()
-            
             return ordered_abstracts
 
         except Exception as e:
@@ -356,10 +281,10 @@ class VectorStoreService:
             
     def retrieve_query_specific_chunks(self, claim_text, top_k):
         """Retrieves top_k relevant study abstracts only from those added in the current session."""
-        # Ensure embedding model is loaded
+        # Ensure model is loaded
         self._ensure_embedding_model()
         
-        if not self.embedding_model or not self.index:
+        if embedding_model is None or self.index is None:
             logger.error("Embedding model or FAISS index not available.")
             return []
             
@@ -385,38 +310,42 @@ class VectorStoreService:
             id_to_position = {}  # Maps study_id to position in temp index
             
             if study_ids:
-                studies = self.db.query(Study).filter(Study.id.in_(study_ids)).all()
-                for i, study in enumerate(studies):
-                    if study.abstract:
-                        abstracts_to_embed.append(study.abstract)
-                        id_to_position[study.id] = i
+                # Process in batches to avoid large IN clauses
+                batch_size = app.config['EMBEDDING_BATCH_SIZE']
+                for i in range(0, len(study_ids), batch_size):
+                    batch_ids = study_ids[i:i+batch_size]
+                    studies = self.db.query(Study).filter(Study.id.in_(batch_ids)).all()
+                    
+                    for study in studies:
+                        if study.abstract:
+                            # Truncate very long abstracts
+                            abstract = study.abstract[:5000] if len(study.abstract) > 5000 else study.abstract
+                            abstracts_to_embed.append(abstract)
+                            id_to_position[study.id] = len(abstracts_to_embed) - 1
+                    
+                    # Clear memory after each batch
+                    gc.collect()
             
             # If we have abstracts to embed, create temporary embeddings
             if abstracts_to_embed:
                 logger.info(f"Re-embedding {len(abstracts_to_embed)} abstracts for query-specific search")
                 # Use smaller batches for re-embedding to avoid memory issues
-                batch_size = app.config['BATCH_SIZE']  # Use configured batch size
-                all_embeddings = []
+                batch_size = app.config['EMBEDDING_BATCH_SIZE']
                 
                 for i in range(0, len(abstracts_to_embed), batch_size):
                     batch = abstracts_to_embed[i:i+batch_size]
-                    batch_embeddings = self.embedding_model.encode(batch, show_progress_bar=False)
                     
-                    # Convert to float32 and add directly to temp index to save memory
+                    # Embed and immediately add to the temp index (don't store in memory)
+                    batch_embeddings = embedding_model.encode(batch, show_progress_bar=False)
                     batch_embeddings_np = np.array(batch_embeddings).astype('float32')
                     temp_index.add(batch_embeddings_np)
                     
-                    # Update id_to_position mapping
-                    for j, study_id in enumerate(study_ids[i:i+batch_size]):
-                        if study_id in id_to_position:
-                            id_to_position[study_id] = i + j
-                    
-                    # Clear batch memory
+                    # Clean up after each batch
                     del batch_embeddings, batch_embeddings_np
                     gc.collect()
                 
                 # Now search only this temporary index with our claim
-                claim_embedding = self.embedding_model.encode([claim_text])
+                claim_embedding = embedding_model.encode([claim_text])
                 claim_embedding_np = np.array(claim_embedding).astype('float32')
                 
                 # Search the temporary index
@@ -434,20 +363,30 @@ class VectorStoreService:
                             relevant_study_ids.append(study_id)
                             break
                 
-                # Retrieve abstracts from the database
+                # Retrieve abstracts from the database in batches
+                ordered_abstracts = []
+                
                 if relevant_study_ids:
-                    relevant_studies = self.db.query(Study).filter(Study.id.in_(relevant_study_ids)).all()
-                    study_dict = {s.id: s.abstract for s in relevant_studies if s.abstract}
-                    
-                    # Order by relevance
-                    ordered_abstracts = []
-                    for study_id in relevant_study_ids:
-                        if study_id in study_dict:
-                            ordered_abstracts.append(study_dict[study_id])
+                    # Process in smaller batches to reduce memory usage
+                    for i in range(0, len(relevant_study_ids), batch_size):
+                        batch_ids = relevant_study_ids[i:i+batch_size]
+                        relevant_studies = self.db.query(Study).filter(Study.id.in_(batch_ids)).all()
+                        
+                        # Create mapping for this batch
+                        batch_dict = {s.id: s.abstract for s in relevant_studies if s.abstract}
+                        
+                        # Add to results in order of relevance
+                        for study_id in batch_ids:
+                            if study_id in batch_dict:
+                                ordered_abstracts.append(batch_dict[study_id])
+                        
+                        # Clean up batch memory
+                        del batch_dict
+                        gc.collect()
                     
                     logger.info(f"Retrieved {len(ordered_abstracts)} most relevant abstracts from query-specific pool")
                     
-                    # Clean up memory
+                    # Clean up
                     del temp_index, distances, indices, claim_embedding, claim_embedding_np
                     gc.collect()
                     
@@ -789,47 +728,67 @@ class SemanticScholarService:
 
 # --- Modified Gemini Service ---
 class GeminiService:
-    def __init__(self, model=None):
-        self.model = model
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        self.model = None
+
+    def _ensure_model_loaded(self):
+        """Lazily initialize the Gemini model when needed"""
+        global gemini_model
+        
+        if self.model is None:
+            if gemini_model is not None:
+                self.model = gemini_model
+            elif self.api_key:
+                try:
+                    logger.info("Initializing Gemini model")
+                    genai.configure(api_key=self.api_key)
+                    self.model = genai.GenerativeModel('gemini-2.0-flash')
+                    gemini_model = self.model  # Store for future use
+                    logger.info("Successfully initialized Gemini model")
+                    # Force garbage collection
+                    gc.collect()
+                except Exception as e:
+                    logger.error(f"Failed to initialize Gemini model: {e}")
+                    self.model = None
+            else:
+                logger.error("Cannot initialize Gemini model: No API key provided")
+        
+        return self.model
 
     def preprocess_claim(self, claim):
         """Extracts keywords and category from the claim using Gemini."""
-        if not self.model:
+        # Ensure model is loaded
+        model = self._ensure_model_loaded()
+        
+        if not model:
             logger.error("Gemini model not available for preprocessing.")
             # Fallback: Use simple keyword extraction (e.g., based on nouns/verbs) or return empty
             return {"keywords": [], "category": "unknown"}
 
+        # Use a shorter prompt with fewer keywords for lower memory usage
         prompt = f"""
         Analyze the following claim to help find relevant academic research.
         Claim: "{claim}"
 
-        1.  **Extract Key Terms:** Identify the 6-7 most important nouns, noun phrases, or technical terms central to the claim's core assertion. These terms should be suitable for searching academic databases like OpenAlex and CrossRef.
-        2.  **Categorize Claim:** Classify the claim into ONE primary category from the following list:
+        1.  **Extract Key Terms:** Identify 3-4 most important keywords central to the claim.
+        2.  **Categorize Claim:** Classify into ONE primary category:
             *   Health & Medicine
             *   Biology & Life Sciences
-            *   Physical Sciences (Physics, Chemistry, Astronomy)
+            *   Physical Sciences
             *   Earth & Environmental Sciences
             *   Technology & Engineering
-            *   Social Sciences (Psychology, Sociology, Economics, Politics)
-            *   Humanities (History, Arts, Literature)
+            *   Social Sciences
+            *   Humanities
             *   Mathematics & Computer Science
             *   General / Other
 
-        Return the results ONLY as a JSON object with keys "keywords" (a list of strings) and "category" (a single string). Do not include any explanations or surrounding text.
-
-        Example:
-        Claim: "Regular exercise reduces the risk of cardiovascular disease."
-        {{
-            "keywords": ["regular exercise", "cardiovascular disease", "risk reduction"],
-            "category": "Health & Medicine"
-        }}
-
-        Now, analyze the claim provided above.
+        Return ONLY a JSON object with keys "keywords" (list of strings) and "category" (single string).
         """
 
         try:
             logger.info(f"Sending preprocessing request to Gemini for claim: '{claim}'")
-            response = self.model.generate_content(prompt)
+            response = model.generate_content(prompt)
             response_text = response.text
 
             # Robust JSON extraction
@@ -849,15 +808,16 @@ class GeminiService:
                  # Fallback or re-attempt logic could go here
                  return {"keywords": [], "category": "unknown", "error": "LLM parsing failed"}
 
-
         except Exception as e:
             logger.error(f"Error during Gemini claim preprocessing: {e}")
             return {"keywords": [], "category": "unknown", "error": str(e)}
-
-
+            
     def analyze_with_rag(self, claim, evidence_chunks):
         """Analyzes the claim against retrieved evidence chunks using Gemini RAG."""
-        if not self.model:
+        # Ensure model is loaded
+        model = self._ensure_model_loaded()
+        
+        if not model:
             logger.error("Gemini model not available for RAG analysis.")
             return {
                 "verdict": "Inconclusive",
@@ -873,11 +833,16 @@ class GeminiService:
                 "confidence": 0.0
             }
 
+        # Use a smaller subset of chunks if there are too many
+        if len(evidence_chunks) > app.config['RAG_TOP_K']:
+            evidence_chunks = evidence_chunks[:app.config['RAG_TOP_K']]
+            logger.info(f"Limiting evidence chunks for RAG analysis to {app.config['RAG_TOP_K']}")
+
         # Format evidence for the prompt
-        formatted_evidence = "\n\n".join([f"Evidence Chunk {i+1}:\n{chunk}" for i, chunk in enumerate(evidence_chunks)])
+        formatted_evidence = "\n\n".join([f"Evidence Chunk {i+1}:\n{chunk[:1000]}" for i, chunk in enumerate(evidence_chunks)])
 
         prompt = f"""
-        You are a meticulous fact-checking analyst. Your task is to evaluate the following claim based *only* on the provided evidence chunks extracted from academic abstracts.
+        You are a fact-checking analyst evaluating the following claim based only on the provided evidence chunks.
 
         Claim: "{claim}"
 
@@ -887,77 +852,51 @@ class GeminiService:
         ---
 
         Instructions:
-        1.  Carefully read the claim and each evidence chunk.
-        2.  Determine how accurate the claim is based on the available scientific evidence.
-        3.  Create TWO different summaries:
-            a. First, provide a DETAILED SCIENTIFIC summary (3-5 sentences) that references specific evidence chunks. **Crucially, when referencing evidence chunk numbers (e.g., chunk 5, or chunks 5, 12, and 18), you MUST wrap the reference in the format `[EVIDENCE_CHUNK:NUMBERS]` where NUMBERS is a comma-separated list of the chunk numbers. Example: `... findings from [EVIDENCE_CHUNK:5,12,18] indicate ...` or `... as shown in [EVIDENCE_CHUNK:3] ...`. Do NOT use any other format for referencing chunks.**
-            b. Second, provide a SIMPLIFIED summary (2-3 sentences) in plain language that explains your assessment to a general audience without technical jargon or references to specific evidence chunks.
-        4.  Assign an ACCURACY SCORE between 0.0 (completely inaccurate) and 1.0 (completely accurate) to the claim. This score should reflect how well the claim is supported by the scientific evidence provided.
-        5.  If you still want to provide a categorical verdict, include it as "Supported", "Partially Supported", "Refuted", or "Inconclusive".
+        1. Carefully read the claim and evidence.
+        2. Determine claim accuracy based on evidence.
+        3. Create two summaries:
+           a. Detailed scientific summary (3 sentences) referencing evidence chunks in format [EVIDENCE_CHUNK:N].
+           b. Simplified summary (2 sentences) for general audience.
+        4. Assign accuracy score between 0.0 (inaccurate) and 1.0 (accurate).
+        5. Add verdict: "Supported", "Partially Supported", "Refuted", or "Inconclusive".
 
-        Return ONLY a JSON object with the keys "verdict", "detailed_reasoning", "simplified_reasoning", and "accuracy_score". Do not include any other text, markdown formatting, or explanations outside the JSON structure.
-
-        Example Output:
-        {{
-            "verdict": "Partially Supported",
-            "detailed_reasoning": "Evidence [EVIDENCE_CHUNK:3,7,12] suggests potential health benefits under specific conditions, while [EVIDENCE_CHUNK:5,9,15] indicate possible limitations. Methodological considerations noted in [EVIDENCE_CHUNK:2,8,14] and the need for more controlled trials are emphasized. The research provides moderate support for the claim, but with notable limitations ([EVIDENCE_CHUNK:4,11]).",
-            "simplified_reasoning": "The research provides some support for this claim, but with important limitations. Some studies show potential benefits, while others highlight concerns. Scientists agree that the claim is partially accurate but more research is needed.",
-            "accuracy_score": 0.6
-        }}
-
-        Now, analyze the claim and evidence provided above.
+        Return ONLY a JSON object with keys "verdict", "detailed_reasoning", "simplified_reasoning", and "accuracy_score".
         """
 
         try:
             logger.info(f"Sending RAG analysis request to Gemini for claim: '{claim}'")
-            response = self.model.generate_content(prompt)
+            response = model.generate_content(prompt)
             response_text = response.text
 
-             # Robust JSON extraction
+            # Robust JSON extraction
             try:
                 json_start = response_text.index('{')
                 json_end = response_text.rindex('}') + 1
                 json_str = response_text[json_start:json_end]
                 result = json.loads(json_str)
-                 # Validate expected keys
-                if "verdict" in result and ("detailed_reasoning" in result or "reasoning" in result) and ("accuracy_score" in result or "confidence" in result):
-                    # Log accuracy score if available
-                    accuracy_message = ""
-                    if "accuracy_score" in result:
-                        accuracy_message = f"Accuracy Score: {result['accuracy_score']}"
-                    elif "confidence" in result:
-                        # For backward compatibility
-                        result["accuracy_score"] = result["confidence"]
-                        accuracy_message = f"Confidence: {result['confidence']}"
-                    
-                    logger.info(f"Successfully analyzed claim. {accuracy_message}")
-                    
-                    # Ensure backward compatibility
-                    if "reasoning" in result and "detailed_reasoning" not in result:
-                        result["detailed_reasoning"] = result["reasoning"]
-                    if "simplified_reasoning" not in result:
-                        result["simplified_reasoning"] = result.get("reasoning", "Analysis complete but summary unavailable.")
+                # Validate expected keys
+                if "verdict" in result and "detailed_reasoning" in result and "accuracy_score" in result:
+                    logger.info(f"Successfully analyzed claim. Accuracy Score: {result['accuracy_score']}")
                     return result
                 else:
                     raise ValueError("Missing or invalid keys in JSON response.")
             except (ValueError, IndexError) as e:
-                 logger.error(f"Failed to parse JSON from Gemini RAG response: {e}. Response: {response_text}")
-                 # Fallback or re-attempt logic could go here
-                 return {
-                     "verdict": "Error",
-                     "reasoning": "LLM analysis failed to produce valid JSON output.",
-                     "detailed_reasoning": "LLM analysis failed to produce valid JSON output.",
-                     "simplified_reasoning": "Analysis failed. Please try again.",
-                     "accuracy_score": 0.0
-                 }
+                logger.error(f"Failed to parse JSON from Gemini RAG response: {e}. Response: {response_text}")
+                return {
+                    "verdict": "Error",
+                    "reasoning": "LLM analysis failed to produce valid JSON output.",
+                    "detailed_reasoning": "Analysis failed to produce valid JSON output.",
+                    "simplified_reasoning": "Analysis failed. Please try again.",
+                    "accuracy_score": 0.0
+                }
 
         except Exception as e:
             logger.error(f"Error during Gemini RAG analysis: {e}")
             return {
                 "verdict": "Error",
-                "reasoning": f"An unexpected error occurred during analysis: {str(e)}",
-                "detailed_reasoning": f"An unexpected error occurred during analysis: {str(e)}",
-                "simplified_reasoning": "An unexpected error occurred during analysis.",
+                "reasoning": f"An error occurred during analysis: {str(e)}",
+                "detailed_reasoning": f"An error occurred during analysis: {str(e)}",
+                "simplified_reasoning": "An error occurred during analysis.",
                 "accuracy_score": 0.0
             }
 
@@ -989,100 +928,109 @@ class RAGVerificationService:
 
         logger.info(f"Extracted Keywords: {keywords}, Category: {category}")
 
-        # 2. Retrieve Evidence - from all three sources
+        # 2. Retrieve Evidence - process each source sequentially to save memory
         max_results_per_source = app.config['MAX_EVIDENCE_TO_RETRIEVE']
-        
-        # Retrieve and process studies in sequence to avoid holding all data in memory at once
         all_studies_data = []
         
-        # Process OpenAlex first
+        # Process OpenAlex
         logger.info("Retrieving studies from OpenAlex...")
         openalex_data = self.openalex.search_works_by_keyword(keywords, per_page=max_results_per_source)
-        openalex_studies = self.openalex.process_results(openalex_data)
-        all_studies_data.extend(openalex_studies)
-        # Free memory
-        del openalex_data, openalex_studies
-        gc.collect()
+        if openalex_data:
+            openalex_studies = self.openalex.process_results(openalex_data)
+            all_studies_data.extend(openalex_studies)
+            # Release memory
+            del openalex_data, openalex_studies
+            gc.collect()
         
-        # Process CrossRef next
+        # Process CrossRef
         logger.info("Retrieving studies from CrossRef...")
         crossref_data = self.crossref.search_works_by_keyword(keywords, rows=max_results_per_source)
-        crossref_studies = self.crossref.process_results(crossref_data)
-        all_studies_data.extend(crossref_studies)
-        # Free memory
-        del crossref_data, crossref_studies
-        gc.collect()
+        if crossref_data:
+            crossref_studies = self.crossref.process_results(crossref_data)
+            all_studies_data.extend(crossref_studies)
+            # Release memory
+            del crossref_data, crossref_studies
+            gc.collect()
         
-        # Process Semantic Scholar last
+        # Process Semantic Scholar
         logger.info("Retrieving studies from Semantic Scholar...")
         semantic_scholar_data = self.semantic_scholar.search_works_by_keyword(keywords, limit=max_results_per_source)
-        semantic_scholar_studies = self.semantic_scholar.process_results(semantic_scholar_data)
-        all_studies_data.extend(semantic_scholar_studies)
-        # Free memory
-        del semantic_scholar_data, semantic_scholar_studies
-        gc.collect()
-        
+        if semantic_scholar_data:
+            semantic_scholar_studies = self.semantic_scholar.process_results(semantic_scholar_data)
+            all_studies_data.extend(semantic_scholar_studies)
+            # Release memory
+            del semantic_scholar_data, semantic_scholar_studies
+            gc.collect()
+
         logger.info(f"Retrieved a total of {len(all_studies_data)} studies from all sources.")
 
-        # --- Enhanced Filtering & Deduplication (optimized for memory) ---
+        # 3. Filter and deduplicate studies
+        # Process in smaller batches to avoid memory pressure
         seen_dois = set()
-        seen_titles = {} # For deduplicating studies without DOIs
+        seen_titles = {}
         unique_studies_data = []
         
-        # Process in batches to avoid memory pressure
-        batch_size = app.config['BATCH_SIZE']
+        # First filter by abstract presence and length
+        filtered_studies = []
+        for study in all_studies_data:
+            if study.get('abstract') and len(study.get('abstract', '')) >= 50:
+                filtered_studies.append(study)
         
-        # First pass: process studies with DOIs (preferred)
-        doi_studies = [s for s in all_studies_data if s.get('doi') and s.get('abstract') and len(s.get('abstract', '')) >= 50]
+        # Release memory
+        del all_studies_data
+        gc.collect()
         
-        for i in range(0, len(doi_studies), batch_size):
-            batch = doi_studies[i:i+batch_size]
-            
-            for study_data in batch:
-                doi = study_data.get('doi')
-                if doi not in seen_dois:
-                    unique_studies_data.append(study_data)
-                    seen_dois.add(doi)
-                    # Also track title to avoid duplicate non-DOI studies
-                    title = study_data.get('title')
-                    if title:
-                        title_lower = title.lower()
-                        seen_titles[title_lower] = True
-            
-            # Force garbage collection after each batch
-            gc.collect()
-            
-        # Second pass: consider studies without DOIs based on title similarity
-        non_doi_studies = [s for s in all_studies_data if not s.get('doi') and s.get('abstract') and len(s.get('abstract', '')) >= 50]
+        # Get batch size from config
+        batch_size = app.config['EMBEDDING_BATCH_SIZE']
         
-        for i in range(0, len(non_doi_studies), batch_size):
-            batch = non_doi_studies[i:i+batch_size]
-            
-            for study_data in batch:
-                title = study_data.get('title')
-                # Skip if title is None or empty
+        # Process studies with DOIs first
+        for study in filtered_studies:
+            doi = study.get('doi')
+            if doi and doi not in seen_dois:
+                unique_studies_data.append(study)
+                seen_dois.add(doi)
+                
+                # Also track title to avoid duplicate non-DOI studies
+                title = study.get('title')
+                if title:
+                    title_lower = title.lower()
+                    seen_titles[title_lower] = True
+                    
+            # Force garbage collection every 10 studies
+            if len(unique_studies_data) % 10 == 0:
+                gc.collect()
+        
+        # Then process non-DOI studies
+        for study in filtered_studies:
+            doi = study.get('doi')
+            if not doi:
+                title = study.get('title')
                 if not title:
                     continue
                     
                 title_lower = title.lower()
-                # Skip if we've seen this title
                 if title_lower in seen_titles:
                     continue
-                    
-                # Simple title similarity check - more memory efficient than complex algorithms
+                
+                # Simple similarity check with only the first 100 titles
                 duplicate_found = False
-                for existing_title in list(seen_titles.keys())[:100]:  # Limit check to first 100 titles to save memory
+                for existing_title in list(seen_titles.keys())[:100]:
                     if existing_title and (existing_title in title_lower or title_lower in existing_title):
                         duplicate_found = True
                         break
                         
                 if not duplicate_found:
-                    unique_studies_data.append(study_data)
+                    unique_studies_data.append(study)
                     seen_titles[title_lower] = True
             
-            # Force garbage collection after each batch
-            gc.collect()
-            
+            # Force garbage collection every 10 studies
+            if len(unique_studies_data) % 10 == 0:
+                gc.collect()
+        
+        # Release memory
+        del filtered_studies, seen_titles
+        gc.collect()
+
         # Reset vector store's session tracking for this new query
         self.vector_store.current_session_indices = []
         self.vector_store.current_session_study_ids = []
@@ -1101,23 +1049,25 @@ class RAGVerificationService:
                 "processing_time_seconds": time.time() - start_time
             }
 
-        # 3. Store Evidence in DB - optimized for larger study pools
+        # 4. Store Evidence in DB - optimized for memory usage
         stored_studies = []
-        batch_size = app.config['BATCH_SIZE']
+        batch_size = min(10, app.config['EMBEDDING_BATCH_SIZE'] * 2)  # Small batches to avoid memory issues
         
         try:
             # Create a map of existing DOIs to avoid redundant queries
             existing_dois = {}
-            if unique_studies_data:
-                study_dois = [s.get('doi') for s in unique_studies_data if s.get('doi')]
-                if study_dois:
-                    # Process DOIs in batches to avoid memory issues with large IN clauses
-                    for i in range(0, len(study_dois), batch_size):
-                        batch_dois = study_dois[i:i+batch_size]
-                        existing_studies = self.db.query(Study.doi, Study.id).filter(Study.doi.in_(batch_dois)).all()
-                        for study in existing_studies:
-                            existing_dois[study.doi] = study.id
-                    logger.info(f"Found {len(existing_dois)} already existing studies in database")
+            
+            # Process DOIs in batches
+            study_dois = [s.get('doi') for s in unique_studies_data if s.get('doi')]
+            if study_dois:
+                for i in range(0, len(study_dois), batch_size):
+                    batch_dois = study_dois[i:i+batch_size]
+                    existing_studies = self.db.query(Study.doi, Study.id).filter(Study.doi.in_(batch_dois)).all()
+                    for study in existing_studies:
+                        existing_dois[study.doi] = study.id
+                    # Free memory
+                    gc.collect()
+                logger.info(f"Found {len(existing_dois)} already existing studies in database")
             
             # Process studies in batches
             for i in range(0, len(unique_studies_data), batch_size):
@@ -1157,12 +1107,17 @@ class RAGVerificationService:
                     
                     # Create new study object
                     try:
+                        # Truncate very long abstracts to prevent memory issues
+                        abstract = study_data.get('abstract', '')
+                        if len(abstract) > 10000:  # Limit abstract size
+                            abstract = abstract[:10000]
+                            
                         study_obj = Study(
                             doi=study_data.get('doi'),
                             title=study_data.get('title'),
                             authors=study_data.get('authors'),
                             pub_date=study_data.get('pub_date'),
-                            abstract=study_data.get('abstract'),
+                            abstract=abstract,
                             source_api=study_data.get('source_api'),
                             citation_count=study_data.get('citation_count', 0)
                         )
@@ -1200,12 +1155,16 @@ class RAGVerificationService:
                                         continue
                                 
                                 # Create and add the study
+                                abstract = study_data.get('abstract', '')
+                                if len(abstract) > 10000:  # Limit abstract size
+                                    abstract = abstract[:10000]
+                                    
                                 study_obj = Study(
                                     doi=study_data.get('doi'),
                                     title=study_data.get('title'),
                                     authors=study_data.get('authors'),
                                     pub_date=study_data.get('pub_date'),
-                                    abstract=study_data.get('abstract'),
+                                    abstract=abstract,
                                     source_api=study_data.get('source_api'),
                                     citation_count=study_data.get('citation_count', 0)
                                 )
@@ -1217,10 +1176,10 @@ class RAGVerificationService:
                                 self.db.rollback()
                                 logger.warning(f"Error adding individual study: {individual_error}")
                 
-                # Clean up after processing each batch
+                # Clear memory after each batch
                 gc.collect()
-                    
-            # Clean up memory after all database operations
+            
+            # Release memory now that we've stored everything
             del unique_studies_data, existing_dois
             gc.collect()
             
@@ -1233,28 +1192,27 @@ class RAGVerificationService:
             logger.error(f"Unexpected error storing evidence: {e}")
             return {"error": "Unexpected error storing evidence.", "status": "failed"}
 
-        # 4. Embed and Store in Vector DB
+        # 5. Embed and Store in Vector DB
         logger.info(f"Embedding all {len(stored_studies)} studies in the vector database")
         self.vector_store.embed_and_store(stored_studies) # Pass the SQLAlchemy objects
 
-        # 5. Retrieve Relevant Chunks via vector search on CURRENT CLAIM'S studies only
+        # 6. Retrieve Relevant Chunks via vector search on CURRENT CLAIM'S studies only
         top_k = app.config['RAG_TOP_K']
         logger.info(f"Performing vector search on this claim's specific pool of {len(self.vector_store.current_session_indices)} studies")
         relevant_chunks = self.vector_store.retrieve_query_specific_chunks(claim, top_k=top_k)
         
-        # Only fallback if absolutely necessary and configured to do so
+        # In low memory mode, don't perform fallback
         if not relevant_chunks and not app.config['LOW_MEMORY_MODE']:
-            logger.warning("Query-specific search returned no results")
-            # This should rarely happen since we're searching the pool we just fetched
-            # unless there was an error in embedding or the pool had no viable abstracts
-            
+            logger.warning("Query-specific search returned no results, trying fallback")
             # Check if we have a reasonable number of global studies to search
-            global_index_size = self.vector_store.index.ntotal
+            global_index_size = self.vector_store.index.ntotal if self.vector_store.index else 0
             if global_index_size > top_k:
                 logger.info(f"Falling back to global search across all {global_index_size} studies in database")
                 relevant_chunks = self.vector_store.retrieve_relevant_chunks(claim, top_k=top_k)
-            else:
-                logger.warning("No fallback possible - insufficient studies in global index")
+        
+        # Clear stored studies from memory once we have the relevant chunks
+        del stored_studies
+        gc.collect()
 
         if not relevant_chunks:
             logger.warning("Could not retrieve any relevant chunks for analysis.")
@@ -1268,34 +1226,36 @@ class RAGVerificationService:
                 "processing_time_seconds": round(time.time() - start_time, 2)
             }
 
-        # 6. Analyze with LLM (Gemini)
+        # 7. Analyze with LLM (Gemini)
         logger.info(f"Analyzing claim with {len(relevant_chunks)} most relevant abstracts via LLM")
         analysis_result = self.gemini.analyze_with_rag(claim, relevant_chunks)
 
-        # 7. Format and Return Output
-        # Retrieve details of the *actually used* evidence chunks for the response
+        # 8. Format and Return Output - Get evidence details in batches
         evidence_details = []
+        
         if relevant_chunks:
-             # Find the studies corresponding to the chunks used in analysis - process in batches
-             abstract_to_study = {}
-             
-             # Process abstracts in batches to avoid large IN clauses
-             for i in range(0, len(relevant_chunks), batch_size):
-                 batch_abstracts = relevant_chunks[i:i+batch_size]
-                 
-                 # Query for each batch
-                 batch_studies = self.db.query(Study).filter(Study.abstract.in_(batch_abstracts)).all()
-                 
-                 # Create mapping for this batch
-                 for study in batch_studies:
-                     if study.citation_count > 5:
-                         abstract_to_study[study.abstract] = study
-             
-             # Get details in the order the chunks were retrieved
-             for chunk in relevant_chunks:
-                 study = abstract_to_study.get(chunk)
-                 if study:
-                     evidence_details.append({
+            # Process abstracts in smaller batches to avoid large IN clauses
+            abstract_to_study = {}
+            batch_size = min(5, app.config['EMBEDDING_BATCH_SIZE'])
+            
+            for i in range(0, len(relevant_chunks), batch_size):
+                batch_abstracts = relevant_chunks[i:i+batch_size]
+                # Query for each batch
+                batch_studies = self.db.query(Study).filter(Study.abstract.in_(batch_abstracts)).all()
+                
+                # Create mapping for this batch, filtering by citation count
+                for study in batch_studies:
+                    if study.citation_count > 5:
+                        abstract_to_study[study.abstract] = study
+                
+                # Clean up batch memory
+                gc.collect()
+            
+            # Get details in the order the chunks were retrieved
+            for chunk in relevant_chunks:
+                study = abstract_to_study.get(chunk)
+                if study:
+                    evidence_details.append({
                         "title": study.title,
                         "link": f"https://doi.org/{study.doi}" if study.doi else None,
                         "doi": study.doi,
@@ -1304,12 +1264,12 @@ class RAGVerificationService:
                         "source_api": study.source_api,
                         "citation_count": study.citation_count
                     })
-             
-             logger.info(f"Filtered evidence to {len(evidence_details)} studies with more than 5 citations")
-             
-             # Free memory
-             del abstract_to_study, relevant_chunks
-             gc.collect()
+            
+            logger.info(f"Filtered evidence to {len(evidence_details)} studies with more than 5 citations")
+            
+            # Clean up memory
+            del abstract_to_study, relevant_chunks
+            gc.collect()
 
         final_response = {
             "claim": claim,
@@ -1318,7 +1278,7 @@ class RAGVerificationService:
             "detailed_reasoning": analysis_result.get("detailed_reasoning", analysis_result.get("reasoning", "Analysis failed.")),
             "simplified_reasoning": analysis_result.get("simplified_reasoning", analysis_result.get("reasoning", "Analysis failed.")),
             "accuracy_score": analysis_result.get("accuracy_score", analysis_result.get("confidence", 0.0)),
-            "evidence": evidence_details, # Provide details of evidence used in RAG
+            "evidence": evidence_details,
             "keywords_used": keywords,
             "category": category,
             "processing_time_seconds": round(time.time() - start_time, 2)
@@ -1327,7 +1287,7 @@ class RAGVerificationService:
         logger.info(f"RAG verification completed for claim: '{claim}'. Accuracy Score: {final_response['accuracy_score']}")
         
         # Final memory cleanup
-        del analysis_result, evidence_details
+        del analysis_result
         gc.collect()
         
         return final_response
@@ -1339,7 +1299,7 @@ class RAGVerificationService:
 openalex_service = OpenAlexService()
 crossref_service = CrossRefService()
 semantic_scholar_service = SemanticScholarService()
-gemini_service = GeminiService(gemini_model)
+gemini_service = GeminiService(gemini_api_key)
 
 
 
@@ -1356,11 +1316,7 @@ def health_check():
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
 
-    gemini_status = "ok" if gemini_model else "unavailable"
-    # Don't check embedding_model status directly since it's lazily loaded
-    embedding_status = "deferred_loading" 
-    faiss_status = "ok" if index is not None else "deferred_loading"
-    
+    # Also report memory usage if possible
     memory_info = {}
     try:
         import psutil
@@ -1372,47 +1328,50 @@ def health_check():
     except ImportError:
         memory_info = {"error": "psutil not available"}
 
+    # Check model status with lazy loading
+    gemini_status = "configured" if gemini_api_key else "unavailable"
+    embedding_status = "configured" if embedding_model_name else "unavailable"
+    
     return jsonify({
         "status": "ok",
         "service": "Factify RAG API",
-        "version": "2.2.0", # Updated version for memory optimizations
+        "version": "2.2.0", # Updated version
         "dependencies": {
             "database": db_status,
-            "gemini_model": gemini_status,
+            "gemini_api": gemini_status,
             "embedding_model": embedding_status,
-            "vector_index": faiss_status,
-            "openalex_api": "ok",
-            "crossref_api": "ok",
-            "semantic_scholar_api": "ok"
+            "vector_store": "configured"
         },
         "memory": memory_info,
         "config": {
-            "low_memory_mode": app.config['LOW_MEMORY_MODE'],
-            "batch_size": app.config['BATCH_SIZE'],
-            "max_evidence_to_retrieve": app.config['MAX_EVIDENCE_TO_RETRIEVE'],
-            "max_evidence_to_store": app.config['MAX_EVIDENCE_TO_STORE'],
-            "rag_top_k": app.config['RAG_TOP_K']
+            "low_memory_mode": app.config.get('LOW_MEMORY_MODE'),
+            "max_evidence_retrieve": app.config.get('MAX_EVIDENCE_TO_RETRIEVE'),
+            "max_evidence_store": app.config.get('MAX_EVIDENCE_TO_STORE'),
+            "rag_top_k": app.config.get('RAG_TOP_K'),
+            "embedding_batch_size": app.config.get('EMBEDDING_BATCH_SIZE')
         }
     })
 
 # --- Updated Claim Verification Endpoint ---
-@app.route('/api/verify_claim', methods=['POST']) 
+@app.route('/api/verify_claim', methods=['POST'])
 def verify_claim_rag():
-    """
-    Verifies a claim using the RAG workflow with memory optimization:
-    1. Preprocesses claim (keywords, category) via LLM.
-    2. Retrieves evidence from OpenAlex & CrossRef.
-    3. Stores evidence in DB.
-    4. Embeds evidence & stores in Vector DB (FAISS).
-    5. Retrieves relevant chunks via Vector Search.
-    6. Analyzes claim + chunks via LLM for verdict.
-    """
+    """Verifies a claim using the RAG workflow with memory optimization."""
+    # Start tracking request processing time
+    start_time = time.time()
+    
+    # Force garbage collection at start of request
+    gc.collect()
+    
     data = request.get_json()
 
     if not data or 'claim' not in data or not data['claim'].strip():
         return jsonify({"error": "Missing or empty 'claim' in request body"}), 400
 
     claim = data['claim']
+    # Truncate very long claims
+    if len(claim) > 1000:
+        claim = claim[:1000]
+        logger.warning("Claim was truncated as it exceeded 1000 characters")
 
     # Get DB session and initialize services that depend on it
     db = next(get_db()) # Get session from generator
@@ -1420,18 +1379,14 @@ def verify_claim_rag():
         # Pass the current db session and the global FAISS index/map
         vector_store = VectorStoreService(db, index, index_to_study_id_map)
         
-        # Initialize Gemini service if not done already
-        if gemini_model is None and app.config.get('GOOGLE_API_KEY'):
-            logger.warning("Gemini model not initialized, attempting to initialize now")
-            # This is a fallback and shouldn't normally happen if app init is correct
-            genai.configure(api_key=app.config.get('GOOGLE_API_KEY'))
-            gemini_model_instance = genai.GenerativeModel('gemini-1.5-flash')
-            gemini_service_instance = GeminiService(gemini_model_instance)
-        else:
-            gemini_service_instance = gemini_service  # Use the global instance
-            
+        # Initialize services with lazy loading
+        gemini_service = GeminiService(gemini_api_key)
+        openalex_service = OpenAlexService(app.config.get('OPENALEX_EMAIL'))
+        crossref_service = CrossRefService(app.config.get('OPENALEX_EMAIL'))
+        semantic_scholar_service = SemanticScholarService()
+        
         rag_service = RAGVerificationService(
-            gemini_service_instance,
+            gemini_service,
             openalex_service,
             crossref_service,
             semantic_scholar_service,
@@ -1442,15 +1397,18 @@ def verify_claim_rag():
         result = rag_service.process_claim_request(claim)
 
         if result.get("status") == "failed":
-             # Handle specific errors if needed, otherwise return generic server error
-             return jsonify({"status": "error", "message": result.get("error", "Processing failed")}), 500
+            # Handle specific errors if needed, otherwise return generic server error
+            return jsonify({"status": "error", "message": result.get("error", "Processing failed")}), 500
 
+        # Add total processing time to response
+        result["total_processing_time"] = round(time.time() - start_time, 2)
+        
         response = {
             "status": "success",
             "result": result
         }
         
-        # Force memory cleanup before returning response
+        # Force garbage collection before returning
         gc.collect()
         
         return jsonify(response)
@@ -1463,44 +1421,29 @@ def verify_claim_rag():
             "detail": str(e) # Optionally include detail in debug mode
         }), 500
     finally:
-        # Ensure session is closed to prevent connection leaks
-        db.close()
-        # Force garbage collection after request completes
+        db.close() # Ensure session is closed
+        # Force garbage collection
         gc.collect()
-
 
 # Run the Flask app
 if __name__ == "__main__":
     port = int(os.getenv('PORT', 8080))
     
-    # Check if we can use psutil for memory monitoring
+    # Log memory configuration
+    logger.info(f"Starting with configuration:")
+    logger.info(f"LOW_MEMORY_MODE: {app.config.get('LOW_MEMORY_MODE')}")
+    logger.info(f"MAX_EVIDENCE_TO_RETRIEVE: {app.config.get('MAX_EVIDENCE_TO_RETRIEVE')}")
+    logger.info(f"MAX_EVIDENCE_TO_STORE: {app.config.get('MAX_EVIDENCE_TO_STORE')}")
+    logger.info(f"RAG_TOP_K: {app.config.get('RAG_TOP_K')}")
+    logger.info(f"EMBEDDING_BATCH_SIZE: {app.config.get('EMBEDDING_BATCH_SIZE')}")
+    
+    # Check initial memory usage if possible
     try:
         import psutil
         process = psutil.Process()
-        initial_memory = process.memory_info().rss / (1024 * 1024)
-        logger.info(f"Initial memory usage: {initial_memory:.2f} MB")
+        logger.info(f"Initial memory usage: {process.memory_info().rss / (1024 * 1024):.2f} MB")
     except ImportError:
-        logger.info("psutil not available for memory monitoring")
-    
-    # Set the initialized global variables for services
-    logger.info("Initializing global services...")
-    
-    # Only initialize embedding model when needed (lazy loading)
-    # This is handled by VectorStoreService._ensure_embedding_model
-    
-    # Initialize OpenAI if API key available
-    if app.config.get('GOOGLE_API_KEY') and gemini_model is None:
-        logger.info("Initializing Gemini service")
-        genai.configure(api_key=app.config.get('GOOGLE_API_KEY'))
-        gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-        gemini_service = GeminiService(gemini_model)
-    
-    # Log configuration
-    logger.info(f"Running in {'LOW_MEMORY_MODE' if app.config['LOW_MEMORY_MODE'] else 'STANDARD_MEMORY_MODE'}")
-    logger.info(f"Batch size set to: {app.config['BATCH_SIZE']}")
-    logger.info(f"Maximum evidence to retrieve per source: {app.config['MAX_EVIDENCE_TO_RETRIEVE']}")
-    logger.info(f"Maximum evidence to store: {app.config['MAX_EVIDENCE_TO_STORE']}")
-    logger.info(f"RAG top-k set to: {app.config['RAG_TOP_K']}")
+        logger.info("psutil not available for memory tracking")
     
     # Use debug=True only for development, ensure it's False in production
     app.run(host="0.0.0.0", port=port, debug=app.config.get("DEBUG", False))
