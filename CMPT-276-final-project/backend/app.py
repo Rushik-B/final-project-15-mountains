@@ -1,5 +1,6 @@
 # app.py
 import os
+import concurrent.futures
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
@@ -11,6 +12,13 @@ import logging
 import datetime
 import re  # Add this at the top with other imports
 import socket  # For DNS resolution test
+
+# Set Tokenizer Parallelism to avoid fork issues (can be 'true' or 'false')
+# Setting to 'false' is often safer in web server environments
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Restrict FAISS threading to avoid resource issues
+os.environ["OMP_NUM_THREADS"] = "4"  # Limit OpenMP threads used by FAISS
 
 # --- New Imports ---
 import sqlite3
@@ -204,102 +212,117 @@ except Exception as e:
 class VectorStoreService:
     def __init__(self, db_session, faiss_index, index_map):
         self.db = db_session
-        self.index = faiss_index
-        self.index_map = index_map
+        self.index = faiss_index # Global index
+        self.index_map = index_map # Global index map (FAISS index -> study_id)
+        # --- Add reverse map ---
+        # study_id -> FAISS index
+        self.study_id_to_faiss_index = {v: k for k, v in index_map.items() if v is not None}
+        # --- End Add reverse map ---
         self.current_pos = max(index_map.keys()) + 1 if index_map else 0
-        # Track the current session's embeddings for query-specific search
-        self.current_session_indices = []
-        self.current_session_study_ids = []
         # Add a synchronization lock to prevent concurrent batch processing
         import threading
         self.embedding_lock = threading.Lock()
 
     def embed_and_store(self, studies):
-        """Embeds abstracts and adds them to the FAISS index in batches."""
+        """Embeds abstracts and adds them to the GLOBAL FAISS index in batches."""
+        # This method now only updates the global index, not used for query-specific search directly
         if not embedding_model or not self.index:
-            logger.error("Embedding model or FAISS index not available.")
+            logger.error("Embedding model or GLOBAL FAISS index not available for storing.")
             return
 
         # Filter studies with abstracts
         studies_with_abstracts = [study for study in studies if study.abstract]
         
         if not studies_with_abstracts:
-            logger.warning("No abstracts found in studies to embed.")
+            logger.warning("No abstracts found in studies to add to global index.")
             return
             
         total_studies = len(studies_with_abstracts)
-        logger.info(f"Preparing to embed {total_studies} abstracts...")
+        logger.info(f"Preparing to embed {total_studies} abstracts for the global index...")
         
         # Process in batches to avoid memory issues
         batch_size = 50  # Adjust based on memory constraints
         total_embedded = 0
         
         # Use lock to prevent concurrent access to FAISS index
-        with self.embedding_lock:
+        with self.embedding_lock: # Lock needed as global index is modified
             for i in range(0, total_studies, batch_size):
                 batch = studies_with_abstracts[i:i+batch_size]
+                # Ensure studies have IDs before proceeding
+                batch = [s for s in batch if s.id is not None]
+                if not batch:
+                    logger.warning(f"Skipping empty batch or batch with no IDs at index {i}")
+                    continue
+
                 batch_size_actual = len(batch)
                 
-                study_ids = []
-                chunks_to_embed = []
-                
-                for study in batch:
-                    study_ids.append(study.id)
-                    chunks_to_embed.append(study.abstract)
+                study_ids = [study.id for study in batch] # Need study IDs
+                chunks_to_embed = [study.abstract for study in batch] # Get abstracts
                 
                 try:
-                    logger.info(f"Embedding batch of {batch_size_actual} abstracts (batch {i//batch_size + 1}/{(total_studies-1)//batch_size + 1})...")
+                    logger.info(f"Embedding batch of {batch_size_actual} abstracts for global index (batch {i//batch_size + 1}/{(total_studies-1)//batch_size + 1})...")
                     embeddings = embedding_model.encode(chunks_to_embed, show_progress_bar=False)
                     embeddings_np = np.array(embeddings).astype('float32')
 
-                    # Add embeddings to FAISS index and update map
+                    # --- Add to global index and update maps ---
                     start_index = self.current_pos
-                    self.index.add(embeddings_np)
+                    self.index.add(embeddings_np) # Add to global index
                     
                     for j, study_id in enumerate(study_ids):
-                        self.index_map[start_index + j] = study_id
-                        # Track indices and study IDs for the current session
-                        self.current_session_indices.append(start_index + j)
-                        self.current_session_study_ids.append(study_id)
+                        faiss_index_pos = start_index + j
+                        self.index_map[faiss_index_pos] = study_id # Update global map
+                        # --- Update reverse map ---
+                        self.study_id_to_faiss_index[study_id] = faiss_index_pos
+                        # --- End update reverse map ---
                     
                     self.current_pos += batch_size_actual
+                    # --- End update maps ---
+
                     total_embedded += batch_size_actual
                     
-                    logger.info(f"Successfully embedded batch. Total embedded: {total_embedded}/{total_studies}")
+                    logger.info(f"Successfully added batch to global index. Total added: {total_embedded}/{total_studies}")
                     
                 except Exception as e:
-                    logger.error(f"Error embedding batch: {e}")
+                    logger.error(f"Error embedding batch for global index: {e}")
                     # Continue with the next batch rather than failing completely
             
-        logger.info(f"Completed embedding process. Total FAISS index size: {self.index.ntotal}")
-        logger.info(f"Current session has {len(self.current_session_indices)} embeddings")
+        logger.info(f"Completed embedding process for global index. Total global FAISS index size: {self.index.ntotal}")
+        logger.info(f"Reverse map size: {len(self.study_id_to_faiss_index)}") # Log reverse map size
 
     def retrieve_relevant_chunks(self, claim_text, top_k):
-        """Retrieves top_k relevant study abstracts based on claim similarity."""
+        """Retrieves top_k relevant study abstracts based on claim similarity FROM THE GLOBAL INDEX."""
+        # This method remains for potential fallback or other uses searching the global index
         if not embedding_model or not self.index or self.index.ntotal == 0:
-            logger.error("Embedding model, FAISS index not available, or index is empty.")
+            logger.error("Embedding model, GLOBAL FAISS index not available, or index is empty.")
             return []
 
         try:
             claim_embedding = embedding_model.encode([claim_text])
             claim_embedding_np = np.array(claim_embedding).astype('float32')
 
-            logger.info(f"Searching FAISS index (size {self.index.ntotal}) for top {top_k} chunks.")
-            distances, indices = self.index.search(claim_embedding_np, top_k)
+            logger.info(f"Searching GLOBAL FAISS index (size {self.index.ntotal}) for top {top_k} chunks.")
+            # Ensure k is not greater than the number of items in the index
+            k_search = min(top_k, self.index.ntotal)
+            if k_search <= 0:
+                 logger.warning("Global index is empty or k is zero, cannot search.")
+                 return []
+
+            distances, indices = self.index.search(claim_embedding_np, k_search)
 
             if not indices.size:
-                logger.warning("FAISS search returned no relevant indices.")
+                logger.warning("Global FAISS search returned no relevant indices.")
                 return []
 
-            # Get the corresponding study IDs from the map
+            # Get the corresponding study IDs from the global map
             relevant_study_ids = [self.index_map[i] for i in indices[0] if i in self.index_map]
 
             if not relevant_study_ids:
-                logger.warning("No matching study IDs found for FAISS indices.")
+                logger.warning("No matching study IDs found for global FAISS indices.")
                 return []
 
             # Retrieve abstracts from the database
-            relevant_studies = self.db.query(Study).filter(Study.id.in_(relevant_study_ids)).all()
+            # Only select needed columns
+            relevant_studies = self.db.query(Study.id, Study.abstract).filter(Study.id.in_(relevant_study_ids)).all()
             # Return abstracts in the order of relevance found by FAISS
             ordered_abstracts = []
             faiss_ordered_ids = [self.index_map[i] for i in indices[0] if i in self.index_map]
@@ -308,107 +331,143 @@ class VectorStoreService:
                  if study_id in study_dict:
                      ordered_abstracts.append(study_dict[study_id])
 
-
-            logger.info(f"Retrieved {len(ordered_abstracts)} relevant abstracts.")
+            logger.info(f"Retrieved {len(ordered_abstracts)} relevant abstracts from GLOBAL index.")
             return ordered_abstracts
 
         except Exception as e:
-            logger.error(f"Error retrieving relevant chunks: {e}")
+            logger.error(f"Error retrieving relevant chunks from GLOBAL index: {e}")
             return []
             
-    def retrieve_query_specific_chunks(self, claim_text, top_k):
-        """Retrieves top_k relevant study abstracts only from those added in the current session."""
-        if not embedding_model or not self.index:
-            logger.error("Embedding model or FAISS index not available.")
+    # --- NEW METHOD for Optimized Query-Specific Search ---
+    def search_query_studies(self, claim_text, studies_for_query, top_k):
+        """
+        Retrieves existing embeddings for the given studies from the global index,
+        builds a temporary FAISS index with them, and searches it for the top_k
+        most relevant abstracts to the claim. Avoids re-embedding.
+        """
+        if not embedding_model: # Should always be available if initialized correctly
+            logger.error("Embedding model not available. Cannot embed claim.")
             return []
-            
-        if not self.current_session_indices:
-            logger.warning("No studies were embedded in the current session.")
+        if not self.index or self.index.ntotal == 0:
+            logger.warning("Global FAISS index is not available or empty. Cannot retrieve vectors.")
             return []
-            
+
+        # Filter studies to index (those with abstracts and valid IDs)
+        studies_to_index = [study for study in studies_for_query if study.abstract and study.id is not None]
+
+        if not studies_to_index:
+            logger.warning("No studies with abstracts provided for query-specific search.")
+            return []
+
+        num_studies = len(studies_to_index)
+        logger.info(f"Starting query-specific search: Reconstructing embeddings for {num_studies} studies.")
+
+        reconstructed_vectors = []
+        ids_for_temp_map = []
+        abstract_map = {} # Still need this to return abstracts at the end
+
+        # 1. Reconstruct vectors from Global Index
+        missing_ids = []
+        with self.embedding_lock: # Use lock when accessing global index/maps
+             # Build lookup map for this query for efficiency if num_studies is large
+             query_study_ids = {s.id for s in studies_to_index}
+             relevant_id_to_faiss_pos = {sid: pos for sid, pos in self.study_id_to_faiss_index.items() if sid in query_study_ids}
+
+        logger.info(f"Found {len(relevant_id_to_faiss_pos)}/{num_studies} studies in the global index map.")
+
+        for study in studies_to_index:
+            study_id = study.id
+            abstract_map[study_id] = study.abstract # Populate abstract map
+
+            faiss_pos = relevant_id_to_faiss_pos.get(study_id)
+
+            if faiss_pos is not None:
+                try:
+                    # Check bounds before reconstructing
+                    if faiss_pos < self.index.ntotal:
+                        vector = self.index.reconstruct(faiss_pos)
+                        reconstructed_vectors.append(vector)
+                        ids_for_temp_map.append(study_id)
+                    else:
+                        logger.warning(f"Study ID {study_id} found in map but FAISS index {faiss_pos} is out of bounds ({self.index.ntotal}). Skipping.")
+                        missing_ids.append(study_id)
+                except Exception as e:
+                    # Catch potential runtime errors from reconstruct
+                    logger.error(f"Error reconstructing vector for study ID {study_id} at index {faiss_pos}: {e}")
+                    missing_ids.append(study_id)
+            else:
+                # This case *shouldn't* happen if embed_and_store ran correctly before this,
+                # but handle defensively.
+                logger.warning(f"Study ID {study_id} not found in global study_id_to_faiss_index map. Cannot reconstruct embedding.")
+                missing_ids.append(study_id)
+
+        if not reconstructed_vectors:
+            logger.error("Could not reconstruct any vectors for the query. Aborting search.")
+            return []
+
+        if missing_ids:
+             logger.warning(f"Could not reconstruct vectors for {len(missing_ids)} studies (IDs: {missing_ids[:10]}...). Proceeding with {len(reconstructed_vectors)} studies.")
+
+
+        logger.info(f"Successfully reconstructed {len(reconstructed_vectors)} vectors.")
+
         try:
-            # Get the actual number of embeddings in the current session
-            session_size = len(self.current_session_indices)
-            logger.info(f"Creating temporary index with {session_size} embeddings specifically for this claim")
-            
-            # Create a temporary FAISS index with same dimension but only containing this session's embeddings
-            dimension = self.index.d  # Get dimension from main index
-            temp_index = faiss.IndexFlatL2(dimension)
-            
-            # Extract embeddings from main index through database and re-embed
-            # This is more reliable than trying to extract from FAISS directly
-            study_ids = self.current_session_study_ids
-            
-            # Get abstracts from the database for these studies
-            abstracts_to_embed = []
-            id_to_position = {}  # Maps study_id to position in temp index
-            
-            if study_ids:
-                studies = self.db.query(Study).filter(Study.id.in_(study_ids)).all()
-                for i, study in enumerate(studies):
-                    if study.abstract:
-                        abstracts_to_embed.append(study.abstract)
-                        id_to_position[study.id] = i
-            
-            # If we have abstracts to embed, create temporary embeddings
-            if abstracts_to_embed:
-                logger.info(f"Re-embedding {len(abstracts_to_embed)} abstracts for query-specific search")
-                # Use smaller batches for re-embedding to avoid memory issues
-                batch_size = 50  # Smaller batch size
-                all_embeddings = []
-                
-                for i in range(0, len(abstracts_to_embed), batch_size):
-                    batch = abstracts_to_embed[i:i+batch_size]
-                    batch_embeddings = embedding_model.encode(batch, show_progress_bar=False)
-                    all_embeddings.append(batch_embeddings)
-                
-                if all_embeddings:
-                    # Combine all batches
-                    combined_embeddings = np.vstack(all_embeddings)
-                    embeddings_np = combined_embeddings.astype('float32')
-                    
-                    # Add to temporary index
-                    temp_index.add(embeddings_np)
-                    
-                    # Now search only this temporary index with our claim
-                    claim_embedding = embedding_model.encode([claim_text])
-                    claim_embedding_np = np.array(claim_embedding).astype('float32')
-                    
-                    # Search the temporary index
-                    temp_top_k = min(top_k, temp_index.ntotal)
-                    distances, indices = temp_index.search(claim_embedding_np, temp_top_k)
-                    
-                    logger.info(f"Performed semantic search on claim-specific pool of {temp_index.ntotal} studies")
-                    
-                    # Map back to study IDs
-                    relevant_study_ids = []
-                    for idx in indices[0]:
-                        # Find which study_id corresponds to this position
-                        for study_id, pos in id_to_position.items():
-                            if pos == idx:
-                                relevant_study_ids.append(study_id)
-                                break
-                    
-                    # Retrieve abstracts from the database
-                    if relevant_study_ids:
-                        relevant_studies = self.db.query(Study).filter(Study.id.in_(relevant_study_ids)).all()
-                        study_dict = {s.id: s.abstract for s in relevant_studies if s.abstract}
-                        
-                        # Order by relevance
-                        ordered_abstracts = []
-                        for study_id in relevant_study_ids:
-                            if study_id in study_dict:
-                                ordered_abstracts.append(study_dict[study_id])
-                        
-                        logger.info(f"Retrieved {len(ordered_abstracts)} most relevant abstracts from query-specific pool")
-                        return ordered_abstracts
-            
-            logger.warning("Could not find relevant abstracts in claim-specific pool")
-            return []
-                
+            # 2. Build temporary FAISS index from reconstructed vectors
+            embeddings_np = np.array(reconstructed_vectors).astype('float32')
+
+            # Basic sanity check on dimensions (reconstructed vectors should match)
+            if embeddings_np.ndim != 2 or embeddings_np.shape[1] != embedding_dimension:
+                 logger.error(f"Reconstructed embedding dimension mismatch! Expected (?, {embedding_dimension}), got {embeddings_np.shape}")
+                 return []
+
+            # Switch back to IndexFlatL2 to avoid multiprocessing issues
+            logger.info(f"Building temporary FAISS index with {embeddings_np.shape[0]} vectors...")
+            temp_index = faiss.IndexFlatL2(embedding_dimension)
+            temp_index.add(embeddings_np)
+            logger.info(f"Built temporary FAISS index with {temp_index.ntotal} reconstructed embeddings.")
+
+            # 3. Create temporary map (temp index position -> study_id)
+            temp_index_map = {i: study_id for i, study_id in enumerate(ids_for_temp_map)}
+
+            # 4. Embed claim
+            claim_embedding = embedding_model.encode([claim_text])
+            claim_embedding_np = np.array(claim_embedding).astype('float32')
+
+            # Ensure claim embedding has correct dimensions (1, embedding_dimension)
+            if claim_embedding_np.ndim == 1 and claim_embedding_np.shape[0] == embedding_dimension:
+                claim_embedding_np = claim_embedding_np.reshape((1, embedding_dimension))
+            elif claim_embedding_np.shape != (1, embedding_dimension):
+                logger.error(f"Claim embedding dimension mismatch! Expected (1, {embedding_dimension}), got {claim_embedding_np.shape}")
+                return []
+
+            # 5. Search temporary index
+            k_search = min(top_k, temp_index.ntotal) # Ensure k is not > index size
+            if k_search <= 0:
+                logger.warning("Temporary index is empty or k is zero.")
+                return []
+
+            logger.info(f"Searching temporary index for top {k_search} matches.")
+            distances, indices = temp_index.search(claim_embedding_np, k_search)
+
+            if not indices.size:
+                logger.warning("Temporary FAISS search returned no relevant indices.")
+                return []
+
+            # 6. Map results and retrieve abstracts
+            relevant_study_ids = [temp_index_map[i] for i in indices[0] if i in temp_index_map]
+
+            # Retrieve abstracts using the abstract_map created earlier
+            ordered_abstracts = [abstract_map[study_id] for study_id in relevant_study_ids if study_id in abstract_map]
+
+            logger.info(f"Retrieved {len(ordered_abstracts)} relevant abstracts from query-specific search using reconstructed vectors.")
+            return ordered_abstracts
+
         except Exception as e:
-            logger.error(f"Error in query-specific vector search: {e}")
+            logger.error(f"Error during query-specific vector search with reconstructed vectors: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
+
 # --- End Vector Store Setup ---
 
 def clean_abstract(text):
@@ -672,8 +731,8 @@ class SemanticScholarService:
             if response.status_code == 429:
                 logger.warning("Semantic Scholar rate limit hit, sleeping for 2 seconds.")
                 time.sleep(2)
-                # Consider adding retry logic or reducing frequency if this persists
-                return None # For now, just return None on rate limit
+                # Retry the request after waiting (previously returned None)
+                return self.search_works_by_keyword(keywords, limit)
 
             # Handle other potential errors
             if response.status_code >= 400:
@@ -932,25 +991,58 @@ class RAGVerificationService:
         # 1. Preprocess Claim (Keywords + Category)
         preprocessing_result = self.gemini.preprocess_claim(claim)
         keywords = preprocessing_result.get("keywords", [])
+        # Use keywords as a string for API searches
+        keyword_string = " ".join(keywords)
         category = preprocessing_result.get("category", "unknown")
+
         if not keywords:
             logger.warning("No keywords extracted, cannot retrieve evidence.")
             return {"error": "Could not extract keywords from claim.", "status": "failed"}
 
         logger.info(f"Extracted Keywords: {keywords}, Category: {category}")
 
-        # 2. Retrieve Evidence - from all three sources
+        # 2. Retrieve Evidence - Concurrently
         max_results_per_source = app.config['MAX_EVIDENCE_TO_RETRIEVE']
-        openalex_data = self.openalex.search_works_by_keyword(keywords, per_page=max_results_per_source)
-        crossref_data = self.crossref.search_works_by_keyword(keywords, rows=max_results_per_source)
-        semantic_scholar_data = self.semantic_scholar.search_works_by_keyword(keywords, limit=max_results_per_source)
+        all_studies_data = []
+        openalex_studies = []
+        crossref_studies = []
+        semantic_scholar_studies = []
 
-        openalex_studies = self.openalex.process_results(openalex_data)
-        crossref_studies = self.crossref.process_results(crossref_data)
-        semantic_scholar_studies = self.semantic_scholar.process_results(semantic_scholar_data)
+        # Use ThreadPoolExecutor for concurrent API calls
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # Submit tasks
+            future_openalex = executor.submit(self.openalex.search_works_by_keyword, keyword_string, per_page=max_results_per_source)
+            future_crossref = executor.submit(self.crossref.search_works_by_keyword, keyword_string, rows=max_results_per_source)
+            future_semantic = executor.submit(self.semantic_scholar.search_works_by_keyword, keyword_string, limit=max_results_per_source)
+
+            # Process results as they complete
+            try:
+                openalex_data = future_openalex.result()
+                if openalex_data:
+                    openalex_studies = self.openalex.process_results(openalex_data)
+                logger.info(f"Retrieved {len(openalex_studies)} studies from OpenAlex.")
+            except Exception as e:
+                logger.error(f"Error retrieving data from OpenAlex: {e}")
+
+            try:
+                crossref_data = future_crossref.result()
+                if crossref_data:
+                    crossref_studies = self.crossref.process_results(crossref_data)
+                logger.info(f"Retrieved {len(crossref_studies)} studies from CrossRef.")
+            except Exception as e:
+                logger.error(f"Error retrieving data from CrossRef: {e}")
+
+            try:
+                semantic_scholar_data = future_semantic.result()
+                if semantic_scholar_data:
+                    semantic_scholar_studies = self.semantic_scholar.process_results(semantic_scholar_data)
+                logger.info(f"Retrieved {len(semantic_scholar_studies)} studies from Semantic Scholar.")
+            except Exception as e:
+                logger.error(f"Error retrieving data from Semantic Scholar: {e}")
 
         all_studies_data = openalex_studies + crossref_studies + semantic_scholar_studies
-        logger.info(f"Retrieved {len(openalex_studies)} studies from OpenAlex, {len(crossref_studies)} from CrossRef, {len(semantic_scholar_studies)} from Semantic Scholar.")
+        logger.info(f"Total studies retrieved before deduplication: {len(all_studies_data)}")
+
 
         # --- Enhanced Filtering & Deduplication ---
         seen_dois = set()
@@ -1006,8 +1098,8 @@ class RAGVerificationService:
                     seen_titles[title_lower] = True
 
         # Reset vector store's session tracking for this new query
-        self.vector_store.current_session_indices = []
-        self.vector_store.current_session_study_ids = []
+        # self.vector_store.current_session_indices = [] # REMOVED
+        # self.vector_store.current_session_study_ids = [] # REMOVED
 
         # Limit total studies to store - already increased in config to 400
         unique_studies_data = unique_studies_data[:app.config['MAX_EVIDENCE_TO_STORE']]
@@ -1145,28 +1237,33 @@ class RAGVerificationService:
             logger.error(f"Unexpected error storing evidence: {e}")
             return {"error": "Unexpected error storing evidence.", "status": "failed"}
 
-        # 4. Embed and Store in Vector DB
-        logger.info(f"Embedding all {len(stored_studies)} studies in the vector database")
-        self.vector_store.embed_and_store(stored_studies) # Pass the SQLAlchemy objects
+        # --- Vector Store Operations ---
+        # 4. Embed and Store *NEW* studies in the global Vector DB (Optional, but keeps global index up-to-date)
+        # Find studies that are truly new (not just updated) to embed
+        # Get IDs of studies already known to the global index map
+        known_global_ids = set(self.vector_store.index_map.values())
+        newly_added_studies = [s for s in stored_studies if s.id is not None and s.id not in known_global_ids]
+        if newly_added_studies:
+             logger.info(f"Embedding {len(newly_added_studies)} new studies to add to the global vector database")
+             # Pass only the new ones to embed_and_store to update the global index
+             self.vector_store.embed_and_store(newly_added_studies)
+        else:
+            logger.info("No new studies to add to the global vector index for this query.")
 
-        # 5. Retrieve Relevant Chunks via vector search on CURRENT CLAIM'S studies only
+
+        # 5. Perform Efficient Query-Specific Vector Search
         top_k = app.config['RAG_TOP_K']
-        logger.info(f"Performing vector search on this claim's specific pool of {len(self.vector_store.current_session_indices)} studies")
-        relevant_chunks = self.vector_store.retrieve_query_specific_chunks(claim, top_k=top_k)
+        logger.info(f"Performing optimized vector search on this query's pool of {len(stored_studies)} studies.")
+        # Call the new method that builds a temporary index and searches it
+        relevant_chunks = self.vector_store.search_query_studies(claim, stored_studies, top_k=top_k)
         
-        # Only fallback if absolutely necessary and configured to do so
-        if not relevant_chunks:
-            logger.warning("Query-specific search returned no results")
-            # This should rarely happen since we're searching the pool we just fetched
-            # unless there was an error in embedding or the pool had no viable abstracts
-            
-            # Check if we have a reasonable number of global studies to search
-            global_index_size = self.vector_store.index.ntotal
-            if global_index_size > top_k:
-                logger.info(f"Falling back to global search across all {global_index_size} studies in database")
-                relevant_chunks = self.vector_store.retrieve_relevant_chunks(claim, top_k=top_k)
-            else:
-                logger.warning("No fallback possible - insufficient studies in global index")
+        # Fallback logic (Optional - keep if global search fallback is desired)
+        # Check global index size using the VectorStoreService's index attribute
+        global_index_size = self.vector_store.index.ntotal if self.vector_store.index else 0
+        if not relevant_chunks and global_index_size > top_k:
+            logger.warning("Query-specific search returned no results. Falling back to global search.")
+            relevant_chunks = self.vector_store.retrieve_relevant_chunks(claim, top_k=top_k) # Assumes retrieve_relevant_chunks still exists and searches global index
+
 
         if not relevant_chunks:
             logger.warning("Could not retrieve any relevant chunks for analysis.")
