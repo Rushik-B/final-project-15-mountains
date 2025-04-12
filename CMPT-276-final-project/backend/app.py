@@ -56,10 +56,13 @@ app.config.update(
     # --- Database Config ---
     DATABASE_URL=os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/postgres'),
     EMBEDDING_MODEL=os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2'),
-    MAX_EVIDENCE_TO_RETRIEVE=int(os.getenv('MAX_EVIDENCE_TO_RETRIEVE', '200')), # Increased from 20 to 200 per source
+    # Replace single limit with specific API limits
+    OPENALEX_MAX_RESULTS=int(os.getenv('OPENALEX_MAX_RESULTS', '200')),
+    CROSSREF_MAX_RESULTS=int(os.getenv('CROSSREF_MAX_RESULTS', '1000')),
+    SEMANTIC_SCHOLAR_MAX_RESULTS=int(os.getenv('SEMANTIC_SCHOLAR_MAX_RESULTS', '100')),
+    # Keep these settings
     MAX_EVIDENCE_TO_STORE=int(os.getenv('MAX_EVIDENCE_TO_STORE', '800')), # Increased default from 400 to 800 total
     RAG_TOP_K=int(os.getenv('RAG_TOP_K', '20')), # Number of chunks for RAG analysis
-
 )
 
 # --- Initialize Embedding Model ---
@@ -987,22 +990,26 @@ class RAGVerificationService:
         logger.info(f"Extracted Keywords: {keywords}, Category: {category}")
 
         # 2. Retrieve Evidence - Concurrently
-        max_results_per_source = app.config['MAX_EVIDENCE_TO_RETRIEVE']
+        # Use specific limits for each API source
+        openalex_limit = app.config['OPENALEX_MAX_RESULTS']
+        crossref_limit = app.config['CROSSREF_MAX_RESULTS']
+        semantic_scholar_limit = app.config['SEMANTIC_SCHOLAR_MAX_RESULTS']
+        
         all_studies_data = []
         openalex_studies = []
         crossref_studies = []
         semantic_scholar_studies = []
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            future_openalex = executor.submit(self.openalex.search_works_by_keyword, keyword_string, per_page=max_results_per_source)
-            future_crossref = executor.submit(self.crossref.search_works_by_keyword, keyword_string, rows=max_results_per_source)
-            future_semantic = executor.submit(self.semantic_scholar.search_works_by_keyword, keyword_string, limit=max_results_per_source)
+            future_openalex = executor.submit(self.openalex.search_works_by_keyword, keyword_string, per_page=openalex_limit)
+            future_crossref = executor.submit(self.crossref.search_works_by_keyword, keyword_string, rows=crossref_limit)
+            future_semantic = executor.submit(self.semantic_scholar.search_works_by_keyword, keyword_string, limit=semantic_scholar_limit)
 
             try:
                 openalex_data = future_openalex.result()
                 if openalex_data:
                     openalex_studies = self.openalex.process_results(openalex_data)
-                logger.info(f"Retrieved {len(openalex_studies)} studies from OpenAlex.")
+                logger.info(f"Retrieved {len(openalex_studies)} studies from OpenAlex (limit: {openalex_limit}).")
             except Exception as e:
                 logger.error(f"Error retrieving data from OpenAlex: {e}")
 
@@ -1010,7 +1017,7 @@ class RAGVerificationService:
                 crossref_data = future_crossref.result()
                 if crossref_data:
                     crossref_studies = self.crossref.process_results(crossref_data)
-                logger.info(f"Retrieved {len(crossref_studies)} studies from CrossRef.")
+                logger.info(f"Retrieved {len(crossref_studies)} studies from CrossRef (limit: {crossref_limit}).")
             except Exception as e:
                 logger.error(f"Error retrieving data from CrossRef: {e}")
 
@@ -1018,7 +1025,7 @@ class RAGVerificationService:
                 semantic_scholar_data = future_semantic.result()
                 if semantic_scholar_data:
                     semantic_scholar_studies = self.semantic_scholar.process_results(semantic_scholar_data)
-                logger.info(f"Retrieved {len(semantic_scholar_studies)} studies from Semantic Scholar.")
+                logger.info(f"Retrieved {len(semantic_scholar_studies)} studies from Semantic Scholar (limit: {semantic_scholar_limit}).")
             except Exception as e:
                 logger.error(f"Error retrieving data from Semantic Scholar: {e}")
 
