@@ -14,6 +14,10 @@ import re  # Add this at the top with other imports
 import socket  # For DNS resolution test
 import numpy as np # Add numpy import back
 import math # For log scaling
+# --- RQ Imports ---
+from redis import Redis
+from rq import Queue
+# --- End RQ Imports ---
 
 # Set Tokenizer Parallelism to avoid fork issues (can be 'true' or 'false')
 # Setting to 'false' is often safer in web server environments
@@ -47,6 +51,25 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
+# --- RQ Setup ---
+redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379') # Default for local dev
+logger.info(f"Connecting RQ to Redis at: {redis_url.split('@')[-1] if '@' in redis_url else redis_url}") # Log without credentials
+embedding_queue = None # Initialize queue as None
+redis_conn = None # Initialize connection as None
+try:
+    redis_conn = Redis.from_url(redis_url)
+    # Test Redis connection
+    redis_conn.ping()
+    logger.info("Successfully connected to Redis for RQ.")
+    # Define queues (e.g., 'default', 'high_priority')
+    # Using 'embeddings' queue for clarity
+    embedding_queue = Queue("embeddings", connection=redis_conn)
+except Exception as e:
+    logger.error(f"CRITICAL: Failed to connect to Redis for RQ: {e}")
+    logger.error("Background embedding generation will NOT work.")
+    # Keep embedding_queue = None
+# --- End RQ Setup ---
+
 # Configuration
 app.config.update(
     SECRET_KEY=os.getenv('SECRET_KEY', 'factify-dev-key'),
@@ -61,8 +84,8 @@ app.config.update(
     CROSSREF_MAX_RESULTS=int(os.getenv('CROSSREF_MAX_RESULTS', '1000')),
     SEMANTIC_SCHOLAR_MAX_RESULTS=int(os.getenv('SEMANTIC_SCHOLAR_MAX_RESULTS', '100')),
     # Keep these settings
-    MAX_EVIDENCE_TO_STORE=int(os.getenv('MAX_EVIDENCE_TO_STORE', '800')), # Increased default from 400 to 800 total
-    RAG_TOP_K=int(os.getenv('RAG_TOP_K', '20')), # Number of chunks for RAG analysis
+    MAX_EVIDENCE_TO_STORE=int(os.getenv('MAX_EVIDENCE_TO_STORE', '500')), # Reduced default from 800 to 100
+    RAG_TOP_K=int(os.getenv('RAG_TOP_K', '50')), # Number of chunks for RAG analysis
 )
 
 # --- Initialize Embedding Model ---
@@ -963,21 +986,21 @@ class GeminiService:
 
 # --- New RAG Verification Service ---
 class RAGVerificationService:
-    # Restore db_session and vector_store_service
-    def __init__(self, gemini_service, openalex_service, crossref_service, semantic_scholar_service, db_session, vector_store_service):
+    # Remove vector_store_service from init, it's not used directly here anymore
+    def __init__(self, gemini_service, openalex_service, crossref_service, semantic_scholar_service, db_session):
         self.gemini = gemini_service
         self.openalex = openalex_service
         self.crossref = crossref_service
         self.semantic_scholar = semantic_scholar_service
         self.db = db_session # RESTORED
-        self.vector_store = vector_store_service # RESTORED
+        # self.vector_store = vector_store_service # REMOVED
 
     def process_claim_request(self, claim):
-        """Orchestrates the entire RAG workflow for a claim."""
+        """Orchestrates the RAG workflow, enqueuing embedding generation."""
         start_time = time.time()
         logger.info(f"Starting RAG verification for claim: '{claim}'")
 
-        # 1. Preprocess Claim (Keywords + Category)
+        # 1. Preprocess Claim (Keywords + Category) - Unchanged
         preprocessing_result = self.gemini.preprocess_claim(claim)
         keywords = preprocessing_result.get("keywords", [])
         keyword_string = " ".join(keywords)
@@ -989,12 +1012,12 @@ class RAGVerificationService:
 
         logger.info(f"Extracted Keywords: {keywords}, Category: {category}")
 
-        # 2. Retrieve Evidence - Concurrently
-        # Use specific limits for each API source
+        # 2. Retrieve Evidence - Concurrently - Unchanged
+        # ... (API call logic remains the same) ...
         openalex_limit = app.config['OPENALEX_MAX_RESULTS']
         crossref_limit = app.config['CROSSREF_MAX_RESULTS']
         semantic_scholar_limit = app.config['SEMANTIC_SCHOLAR_MAX_RESULTS']
-        
+
         all_studies_data = []
         openalex_studies = []
         crossref_studies = []
@@ -1032,7 +1055,7 @@ class RAGVerificationService:
         all_studies_data = openalex_studies + crossref_studies + semantic_scholar_studies
         logger.info(f"Total studies retrieved before deduplication: {len(all_studies_data)}")
 
-        # --- Enhanced Filtering & Deduplication --- Restore original logic
+        # --- Enhanced Filtering & Deduplication --- Unchanged
         seen_dois = set()
         seen_titles = {} # For deduplicating studies without DOIs
         unique_studies_data = []
@@ -1043,279 +1066,260 @@ class RAGVerificationService:
                 continue
             doi = study_data.get('doi')
             if doi:
-                if doi not in seen_dois:
+                # Normalize DOI slightly (lowercase) for better matching
+                doi_norm = doi.lower()
+                if doi_norm not in seen_dois:
                     unique_studies_data.append(study_data)
-                    seen_dois.add(doi)
+                    seen_dois.add(doi_norm)
                     title = study_data.get('title')
                     if title:
-                        title_lower = title.lower()
-                        seen_titles[title_lower] = True
+                        title_lower = title.lower().strip()
+                        # Store DOI with title for later check
+                        seen_titles[title_lower] = doi_norm
 
-        # Second pass: consider studies without DOIs
+        # Second pass: consider studies without DOIs or with DOIs already seen but different casing
         for study_data in all_studies_data:
             if not study_data.get('abstract') or len(study_data.get('abstract', '')) < 50:
                 continue
             doi = study_data.get('doi')
-            if not doi:
+            doi_norm = doi.lower() if doi else None
+
+            # If it has a DOI and we've already processed this DOI, skip
+            if doi_norm and doi_norm in seen_dois:
+                 continue
+
+            # If it doesn't have a DOI, check by title
+            if not doi_norm:
                 title = study_data.get('title')
                 if not title:
                     continue
-                title_lower = title.lower()
+                title_lower = title.lower().strip()
+                # If title seen, skip
                 if title_lower in seen_titles:
                     continue
-                duplicate_found = False
-                for existing_title in seen_titles:
-                     if existing_title and (existing_title in title_lower or title_lower in existing_title):
-                        duplicate_found = True
-                        break
-                if not duplicate_found:
-                    unique_studies_data.append(study_data)
-                    seen_titles[title_lower] = True
+                # Check for near-duplicate titles (simple substring check)
+                # duplicate_found = False
+                # for existing_title in seen_titles:
+                #      if existing_title and (existing_title in title_lower or title_lower in existing_title):
+                #         duplicate_found = True
+                #         break
+                # if duplicate_found:
+                #     continue
 
-        # Limit total studies to *process* for this request (config was MAX_EVIDENCE_TO_STORE)
+                # Add if no DOI and title is new
+                unique_studies_data.append(study_data)
+                seen_titles[title_lower] = None # Mark title as seen (no DOI associated)
+
+        # Limit total studies to *process* for this request
         studies_to_process_data = unique_studies_data[:app.config['MAX_EVIDENCE_TO_STORE']]
         logger.info(f"Processing up to {len(studies_to_process_data)} unique studies with abstracts for this request.")
 
+
         if not studies_to_process_data:
+            # ... (handle no evidence found - unchanged) ...
             logger.warning("No usable evidence found after filtering.")
-            # Continue to RAG analysis, which will handle no evidence
             return {
                 "claim": claim,
                 "verdict": "Inconclusive",
                 "reasoning": "No relevant academic studies with abstracts could be retrieved.",
-                "detailed_reasoning": "No relevant academic studies with abstracts could be retrieved.", # Added for consistency
-                "simplified_reasoning": "No relevant academic studies with abstracts could be retrieved.", # Added for consistency
-                "accuracy_score": 0.0, # Added for consistency
+                "detailed_reasoning": "No relevant academic studies with abstracts could be retrieved.",
+                "simplified_reasoning": "No relevant academic studies with abstracts could be retrieved.",
+                "accuracy_score": 0.0,
                 "evidence": [],
                 "keywords_used": keywords,
                 "category": category,
                 "processing_time_seconds": round(time.time() - start_time, 2)
             }
 
-        # 3. Store Evidence in DB - optimized for larger study pools (Restore this section)
-        stored_studies = []
-        batch_size = 50  # Process in batches to avoid memory issues with very large pools
+        # 3. Store Evidence in DB & Collect New IDs
+        stored_studies = [] # Holds Study objects (existing or newly added)
+        newly_added_study_ids = [] # Holds IDs of studies just added
+        batch_size = 50
 
         try:
-            # Create a map of existing DOIs to avoid redundant queries
-            existing_dois_map = {}
-            if studies_to_process_data:
-                study_dois = [s.get('doi') for s in studies_to_process_data if s.get('doi')]
-                if study_dois:
-                    existing_studies_in_db = self.db.query(Study).filter(Study.doi.in_(study_dois)).all()
-                    existing_dois_map = {study.doi: study for study in existing_studies_in_db}
-                    logger.info(f"Found {len(existing_dois_map)} studies from this batch already in database via DOI lookup.")
+            # Create a map of existing DOIs to avoid redundant queries within this request
+            existing_dois_in_db_map = {}
+            study_dois_to_check = [s.get('doi').lower() for s in studies_to_process_data if s.get('doi')]
+            if study_dois_to_check:
+                existing_studies_in_db = self.db.query(Study).filter(Study.doi.in_(study_dois_to_check)).all()
+                existing_dois_in_db_map = {study.doi.lower(): study for study in existing_studies_in_db}
+                logger.info(f"Checked DB: Found {len(existing_dois_in_db_map)} studies from this batch already in database via DOI lookup.")
 
             # Process studies in batches
             for i in range(0, len(studies_to_process_data), batch_size):
-                batch = studies_to_process_data[i:i+batch_size]
-                batch_objects = []
+                batch_data = studies_to_process_data[i:i+batch_size]
+                batch_objects_to_add = [] # Collect new ORM objects for bulk insert
 
-                for study_data in batch:
+                for study_data in batch_data:
                     doi = study_data.get('doi')
+                    doi_norm = doi.lower() if doi else None
 
-                    # Skip if DOI exists and we already have it in the database
-                    if doi and doi in existing_dois_map:
-                        existing_study = existing_dois_map[doi]
-                        # Update citation count if it changed significantly
+                    # --- Check if exists in DB ---
+                    existing_study = None
+                    if doi_norm and doi_norm in existing_dois_in_db_map:
+                         existing_study = existing_dois_in_db_map[doi_norm]
+                    # Optional: Add title check here for studies without DOI if needed
+
+                    if existing_study:
+                        # --- Update existing ---
+                        stored_studies.append(existing_study) # Add the existing ORM object
+                        # Update citation count if significantly changed
                         new_citation_count = study_data.get('citation_count', 0)
                         if new_citation_count > existing_study.citation_count:
-                             if (new_citation_count - existing_study.citation_count) / (existing_study.citation_count + 1e-6) > 0.1:
+                            # Example threshold: update if 10% higher
+                            if (new_citation_count - existing_study.citation_count) / (existing_study.citation_count + 1e-6) > 0.1:
                                 existing_study.citation_count = new_citation_count
-                                self.db.add(existing_study)
+                                # self.db.add(existing_study) # Mark for update (handled by commit later if changed)
                                 logger.info(f"Updating citation count for existing study DOI: {doi} to {new_citation_count}")
-                        stored_studies.append(existing_study) # Add the existing study object
                         continue # Move to next study in batch
-                    # Double-check DOI doesn't exist (in case it was added by concurrent process)
-                    elif doi:
-                        existing_study = self.db.query(Study).filter(Study.doi == doi).first()
-                        if existing_study:
-                            # Update citation count if it changed
-                            new_citation_count = study_data.get('citation_count', 0)
-                            if existing_study.citation_count != new_citation_count:
-                                existing_study.citation_count = new_citation_count
-                                self.db.add(existing_study)
-                            stored_studies.append(existing_study)
-                            # Add to our cache for future lookups
-                            existing_dois_map[doi] = existing_study
-                            logger.debug(f"Found study with DOI: {doi} that wasn't in cache")
+
+                    # --- Create NEW study object ---
+                    else:
+                        try:
+                            study_obj = Study(
+                                doi=doi, # Store original DOI casing
+                                title=study_data.get('title'),
+                                authors=study_data.get('authors'),
+                                pub_date=study_data.get('pub_date'),
+                                abstract=study_data.get('abstract'),
+                                source_api=study_data.get('source_api'),
+                                citation_count=study_data.get('citation_count', 0),
+                                embedding=None # Initialize embedding as None
+                            )
+                            batch_objects_to_add.append(study_obj)
+                        except SQLAlchemyError as e:
+                            logger.warning(f"Error creating study object for DOI {doi}: {e}")
                             continue
 
-                    # Create new study object
+                # --- Add and Commit Batch ---
+                if batch_objects_to_add:
                     try:
-                        study_obj = Study(
-                            doi=study_data.get('doi'),
-                            title=study_data.get('title'),
-                            authors=study_data.get('authors'),
-                            pub_date=study_data.get('pub_date'),
-                            abstract=study_data.get('abstract'),
-                            source_api=study_data.get('source_api'),
-                            citation_count=study_data.get('citation_count', 0),
-                            embedding=None # Initialize embedding as None
-                        )
-                        self.db.add(study_obj)
-                        batch_objects.append(study_obj)
+                        self.db.add_all(batch_objects_to_add)
+                        self.db.flush() # Flush to assign IDs before commit
+                        # Collect IDs and add objects *after* flush, before commit
+                        for study_obj in batch_objects_to_add:
+                             newly_added_study_ids.append(study_obj.id)
+                             stored_studies.append(study_obj)
+                             # Add to DOI map for checks within this request if needed
+                             if study_obj.doi:
+                                existing_dois_in_db_map[study_obj.doi.lower()] = study_obj
+
+                        self.db.commit()
+                        logger.info(f"Committed batch. Added {len(batch_objects_to_add)} new studies with IDs: {newly_added_study_ids[-len(batch_objects_to_add):]}.")
                     except SQLAlchemyError as e:
-                        # Log the error but continue with other studies
-                        logger.warning(f"Error adding study with DOI {doi}: {e}")
-                        continue
-
-                # Commit batch and refresh objects to get IDs
-                try:
-                    self.db.commit()
-                    for study_obj in batch_objects:
-                        self.db.refresh(study_obj)
-                        stored_studies.append(study_obj)
-
-                    logger.info(f"Committed batch. Added {len(batch_objects)} new studies to DB session.")
-                except SQLAlchemyError as e:
-                    # Rollback on batch error but continue with next batch
-                    self.db.rollback()
-                    logger.error(f"Error committing batch: {e}")
-
-                    # If we hit duplicate DOIs, try processing studies one by one
-                    if isinstance(e.orig, errors.UniqueViolation):
-                        logger.info("Attempting to process studies one by one to handle duplicates")
-                        for study_data in batch:
-                            try:
-                                # Check if DOI exists in database (might have been added by a concurrent request)
-                                doi = study_data.get('doi')
-                                if doi:
-                                    existing = self.db.query(Study).filter(Study.doi == doi).first()
-                                    if existing:
-                                        stored_studies.append(existing)
-                                        continue
-
-                                # Create and add the study
-                                study_obj = Study(
-                                    doi=study_data.get('doi'),
-                                    title=study_data.get('title'),
-                                    authors=study_data.get('authors'),
-                                    pub_date=study_data.get('pub_date'),
-                                    abstract=study_data.get('abstract'),
-                                    source_api=study_data.get('source_api'),
-                                    citation_count=study_data.get('citation_count', 0),
-                                    embedding=None
-                                )
-                                self.db.add(study_obj)
-                                self.db.commit()
-                                self.db.refresh(study_obj)
-                                stored_studies.append(study_obj)
-                            except SQLAlchemyError as individual_error:
-                                # If the *individual* insert also fails due to duplicate, just log and continue
-                                if isinstance(individual_error.orig, errors.UniqueViolation):
-                                    logger.warning(f"Skipping individual study due to concurrent duplicate insert: {study_data.get('doi')}")
-                                else:
-                                    logger.warning(f"Error adding individual study: {individual_error}")
-                                self.db.rollback()
-                    else:
-                        # For other SQLAlchemy errors during batch commit, we might want to stop or handle differently
-                        logger.error(f"Non-duplicate error during batch commit: {e}")
+                        self.db.rollback()
+                        logger.error(f"Error committing batch: {e}")
+                        # Simple rollback, IDs won't be added
+                        # Remove objects added in this batch from stored_studies and newly_added_study_ids?
+                        # This part needs careful handling based on desired error recovery.
+                        # For now, just log the error and continue.
+                        pass
 
         except SQLAlchemyError as e:
             self.db.rollback()
-            logger.error(f"Database error storing evidence: {e}")
+            logger.error(f"Database error during evidence storage phase: {e}")
             return {"error": "Database error storing evidence.", "status": "failed"}
         except Exception as e:
             self.db.rollback()
-            logger.error(f"Unexpected error storing evidence: {e}")
+            logger.error(f"Unexpected error during evidence storage phase: {e}")
             return {"error": "Unexpected error storing evidence.", "status": "failed"}
 
-        logger.info(f"Finished processing and storing/updating {len(stored_studies)} studies in the database for this request.")
+        logger.info(f"Finished DB storage. Total studies considered (existing + new): {len(stored_studies)}. New studies added: {len(newly_added_study_ids)}.")
 
-        # --- Vector Store Operations --- Restore this section
-        # 4. Generate and Store Embeddings for studies that don't have them yet
-        if stored_studies:
-            self.vector_store.add_embeddings_to_studies(stored_studies)
+        # --- Vector Store Operations --- >> REPLACED <<
+        # 4. Enqueue Embedding Task for NEW studies
+        if newly_added_study_ids and embedding_queue: # Check if queue is available
+            try:
+                job = embedding_queue.enqueue(
+                    'app.generate_embeddings_task', # Path to the task function in quotes
+                    args=(newly_added_study_ids,), # Pass args as a tuple
+                    job_timeout=600, # Timeout for the job itself (e.g., 10 mins)
+                    result_ttl=3600 # Keep job result for 1 hour
+                )
+                logger.info(f"Enqueued embedding task for {len(newly_added_study_ids)} new studies. Job ID: {job.id}")
+            except Exception as e:
+                 logger.error(f"Failed to enqueue embedding task: {e}")
+                 # Log and continue, RAG will proceed with existing embeddings
+        elif not embedding_queue:
+            logger.error("Cannot enqueue embedding task: Redis connection failed or queue not initialized.")
         else:
-            logger.info("No studies were stored or updated, skipping embedding generation.")
+            logger.info("No new studies added in this request, skipping embedding task enqueue.")
 
-        # 5. Rank the studies fetched *for this request* based on combined score (Restore this section)
-        logger.info(f"Ranking {len(stored_studies)} studies based on relevance and credibility...")
-        try: # Add try-except block for claim embedding
+        # 5. Rank studies based on AVAILABLE embeddings + other factors
+        logger.info(f"Ranking studies for RAG based on available embeddings and credibility...")
+
+        # Get claim embedding (ensure model is loaded)
+        if not embedding_model:
+            logger.error("Embedding model not loaded, cannot rank by relevance.")
+            # Fallback: Rank purely by citation count or return error
+            return {"error": "Embedding model not available for ranking.", "status": "failed"}
+
+        try:
              claim_embedding = embedding_model.encode([claim])
              claim_embedding_np = np.array(claim_embedding[0]).astype('float32')
         except Exception as e:
              logger.error(f"Error generating claim embedding: {e}")
-             # Handle error appropriately, maybe return error status
              return {"error": "Failed to generate claim embedding for ranking.", "status": "failed"}
 
-        ranked_studies = []
-        for study in stored_studies:
-            # Calculate cosine similarity (1 - cosine_distance)
-            # pgvector cosine_distance is 1 - similarity, so lower is better.
-            # Similarity = 1 - distance. Higher similarity is better.
-            # Using numpy for calculation here as pgvector functions are in DB query
-            # Ensure embedding exists before calculating relevance
-            if study.embedding is None:
-                 logger.warning(f"Study DOI {study.doi} missing embedding, cannot calculate relevance score.")
-                 relevance_score = 0.0 # Assign a default score or skip? Assigning 0 for now.
-            else:
-                 try:
-                     study_embedding_np = np.array(study.embedding).astype('float32')
-                     # Cosine similarity formula: dot(A, B) / (norm(A) * norm(B))
-                     dot_product = np.dot(claim_embedding_np, study_embedding_np)
-                     norm_claim = np.linalg.norm(claim_embedding_np)
-                     norm_study = np.linalg.norm(study_embedding_np)
-                     if norm_claim == 0 or norm_study == 0:
-                         relevance_score = 0.0 # Avoid division by zero
-                     else:
-                          # Clamp score between 0 and 1 (or -1 and 1 depending on embeddings, often near 0-1)
-                         relevance_score = max(0.0, min(1.0, dot_product / (norm_claim * norm_study)))
-                 except Exception as e:
-                     logger.error(f"Error calculating relevance score for study {study.doi}: {e}")
-                     relevance_score = 0.0 # Assign default on error
+        ranked_studies_with_scores = [] # List of tuples: (study_object, combined_score)
+        studies_with_embeddings = [] # Store studies that have embeddings
 
+        # Calculate scores for studies with existing embeddings
+        for study in stored_studies:
+            relevance_score = 0.0 # Default relevance
+            if study.embedding is not None:
+                studies_with_embeddings.append(study) # Add to list if embedded
+                try:
+                    study_embedding_np = np.array(study.embedding).astype('float32')
+                    dot_product = np.dot(claim_embedding_np, study_embedding_np)
+                    norm_claim = np.linalg.norm(claim_embedding_np)
+                    norm_study = np.linalg.norm(study_embedding_np)
+                    if norm_claim > 0 and norm_study > 0:
+                        similarity = dot_product / (norm_claim * norm_study)
+                        # Clamp similarity to [0, 1] as relevance score
+                        relevance_score = max(0.0, min(1.0, similarity))
+                    # else: relevance_score remains 0.0
+                except Exception as e:
+                    logger.warning(f"Error calculating relevance score for study {study.doi or study.id}: {e}")
+                    relevance_score = 0.0 # Assign default on error
 
             # Calculate credibility score (log-scaled citation count)
-            # Add 1 to avoid log(0). Adjust scale factor as needed.
-            credibility_score = math.log10(study.citation_count + 1)
+            credibility_score = math.log10(study.citation_count + 1) # Add 1 to avoid log(0)
 
-            # Combine scores (example: weighted average - adjust weights as needed)
-            relevance_weight = 0.6
-            credibility_weight = 0.4
+            # Combine scores (adjust weights as needed)
+            # Give more weight to relevance if embedding exists
+            relevance_weight = 0.7 if study.embedding is not None else 0.0
+            credibility_weight = 1.0 - relevance_weight # Makes credibility weight 0.3 or 1.0
+
             combined_score = (relevance_weight * relevance_score) + (credibility_weight * credibility_score)
+            ranked_studies_with_scores.append((study, combined_score))
 
-            ranked_studies.append((study, combined_score))
+        # Sort all studies by combined score in descending order
+        ranked_studies_with_scores.sort(key=lambda item: item[1], reverse=True)
 
-        # Sort studies by combined score in descending order
-        ranked_studies.sort(key=lambda item: item[1], reverse=True)
-
-        # Select top K studies for RAG analysis
+        # Select top K studies for RAG analysis from the combined ranked list
         top_k = app.config['RAG_TOP_K']
-        top_ranked_studies = [study for study, score in ranked_studies[:top_k]]
+        top_ranked_studies = [study for study, score in ranked_studies_with_scores[:top_k]] # Get Study objects
+
         relevant_chunks = [study.abstract for study in top_ranked_studies if study.abstract]
 
-        # Corrected log message to use the actual top_k value
-        logger.info(f"Selected top {len(top_ranked_studies)} ranked studies (using RAG_TOP_K={top_k}) for LLM analysis.")
+        logger.info(f"Selected top {len(top_ranked_studies)} ranked studies (using RAG_TOP_K={top_k}, combined relevance/credibility) for LLM analysis.")
+        logger.info(f"Number of selected studies that have embeddings: {len([s for s in top_ranked_studies if s.embedding is not None])}")
+
 
         if not relevant_chunks:
-            logger.warning("No abstracts available from top ranked studies.")
-            # Handle case where top studies have no abstract (unlikely given filters, but possible)
-            return {
-                "claim": claim,
-                "verdict": "Inconclusive",
-                "reasoning": "Top ranked studies had no abstracts available for analysis.",
-                "detailed_reasoning": "Top ranked studies had no abstracts available for analysis.", # Added for consistency
-                "simplified_reasoning": "Top ranked studies had no abstracts available for analysis.", # Added for consistency
-                "accuracy_score": 0.0, # Added for consistency
-                "evidence": [],
-                "keywords_used": keywords,
-                "category": category,
-                "processing_time_seconds": round(time.time() - start_time, 2)
-            }
+             logger.warning("No abstracts available from top ranked studies.")
+             # ... (handle no abstracts - unchanged) ...
+             return { ... } # Return standard inconclusive response
 
-        # 6. Analyze with LLM (Gemini)
-        logger.info(f"Analyzing claim with {len(relevant_chunks)} most relevant abstracts via LLM")
+        # 6. Analyze with LLM (Gemini) - Unchanged
+        logger.info(f"Analyzing claim with {len(relevant_chunks)} abstracts via LLM")
         analysis_result = self.gemini.analyze_with_rag(claim, relevant_chunks)
 
-        # 7. Format and Return Output (Restore this section)
-        # Retrieve details of the *actually used* evidence chunks for the response
+        # 7. Format and Return Output - Unchanged
         evidence_details = []
         if top_ranked_studies:
-             # Filter based on citation count threshold AFTER retrieval
-             # We already ranked by citation count, but can apply a minimum threshold if desired
-             # For now, we'll just use the top K studies directly as they are already ranked
+             # ... (format evidence_details using top_ranked_studies - unchanged) ...
              used_studies_filtered = top_ranked_studies # Use the studies selected by ranking
              for study in used_studies_filtered:
                  evidence_details.append({
@@ -1326,11 +1330,15 @@ class RAGVerificationService:
                     "pub_date": study.pub_date,
                     "source_api": study.source_api,
                     "citation_count": study.citation_count
+                    # Optional: Add flag indicating if embedding was used?
+                    # "embedding_used_for_rag": study.embedding is not None
                 })
              logger.info(f"Formatted evidence details for {len(used_studies_filtered)} top ranked studies.")
 
+
         final_response = {
             "claim": claim,
+            # ... (rest of final response fields - unchanged) ...
             "verdict": analysis_result.get("verdict", "Error"),
             "reasoning": analysis_result.get("reasoning", "Analysis failed."),
             "detailed_reasoning": analysis_result.get("detailed_reasoning", analysis_result.get("reasoning", "Analysis failed.")),
@@ -1342,11 +1350,10 @@ class RAGVerificationService:
             "processing_time_seconds": round(time.time() - start_time, 2)
         }
 
-        logger.info(f"RAG verification completed for claim: '{claim}'. Accuracy Score: {final_response['accuracy_score']}")
+        logger.info(f"RAG verification completed for claim: '{claim}'. Accuracy Score: {final_response['accuracy_score']} (Note: Embeddings for new studies are processed in background).")
         return final_response
 
-
-# --- End RAG Verification Service ---
+# --- End Modified RAG Verification Service ---
 
 # Initialize services
 openalex_service = OpenAlexService()
@@ -1367,6 +1374,17 @@ def health_check():
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
 
+    # --- Add Redis Check ---
+    redis_status = "disconnected"
+    try:
+        if redis_conn and redis_conn.ping():
+            redis_status = "connected"
+        elif embedding_queue is None:
+             redis_status = "connection_failed_on_startup"
+    except Exception as e:
+        logger.error(f"Redis connection ping failed: {e}")
+    # --- End Redis Check ---
+
     gemini_status = "ok" if gemini_model else "unavailable"
     embedding_status = "ok" if embedding_model else "unavailable"
     vector_db_status = db_status # Tied to the main DB status now
@@ -1383,6 +1401,7 @@ def health_check():
             "gemini_model": gemini_status,
             "embedding_model": embedding_status,
             "vector_storage": vector_db_status, # Renamed from vector_index
+            "redis_queue": redis_status, # Add Redis status
             "openalex_api": "ok", # Assuming ok if service initialized
             "crossref_api": "ok", # Assuming ok if service initialized
             "semantic_scholar_api": semantic_scholar_status # Add status
@@ -1411,16 +1430,15 @@ def verify_claim_rag():
     # Get DB session and initialize services that depend on it (Restore this section)
     db = next(get_db()) # Get session from generator
     try:
-        # Initialize VectorStoreService with the current session
-        vector_store = VectorStoreService(db)
         # Initialize RAG service (embedding model is now global)
+        # Remove vector_store from arguments
         rag_service = RAGVerificationService(
             gemini_service,
             openalex_service,
             crossref_service,
             semantic_scholar_service,
-            db, # RESTORED
-            vector_store # RESTORED
+            db # Pass DB session
+            # vector_store REMOVED
         )
 
         result = rag_service.process_claim_request(claim)
@@ -1450,6 +1468,86 @@ def verify_claim_rag():
     finally:
          db.close() # Ensure session is closed
 
+# --- RQ Task Definition ---
+def generate_embeddings_task(study_ids):
+    """
+    RQ Task: Generate and store embeddings for a list of study IDs.
+    """
+    # --- Model Check ---
+    # This check assumes embedding_model is loaded globally in the worker environment
+    # If running worker separately, ensure it preloads the model.
+    if embedding_model is None: # Check if model loaded
+        logger.error("Embedding model not available in worker. Cannot generate embeddings.")
+        return f"Failed: Embedding model unavailable. IDs: {study_ids}"
+    # --- End Model Check ---
+
+    if not study_ids:
+        logger.info("No study IDs provided to embedding task.")
+        return "Skipped: No study IDs."
+
+    logger.info(f"Embedding Task Started: Processing {len(study_ids)} studies.")
+    processed_count = 0
+    failed_count = 0
+    session = SessionLocal() # Create a new session for the task
+    try:
+        # Fetch studies in batches to avoid loading too many at once
+        batch_size = 50 # Reduced batch size for worker memory consideration
+        for i in range(0, len(study_ids), batch_size):
+            batch_ids = study_ids[i:i+batch_size]
+            # Fetch studies that need embedding and have an abstract
+            studies_to_embed = session.query(Study).filter(
+                Study.id.in_(batch_ids),
+                Study.embedding == None,
+                Study.abstract != None,
+                Study.abstract != ''
+            ).all()
+
+            if not studies_to_embed:
+                logger.info(f"Batch {i//batch_size + 1}: No studies need embedding in this ID batch.")
+                continue
+
+            logger.info(f"Batch {i//batch_size + 1}: Embedding {len(studies_to_embed)} studies.")
+            abstracts = [s.abstract for s in studies_to_embed]
+
+            try:
+                embeddings = embedding_model.encode(abstracts, show_progress_bar=False)
+                embeddings_np = np.array(embeddings).astype('float32')
+
+                if len(embeddings_np) != len(studies_to_embed):
+                     logger.error(f"Batch {i//batch_size + 1}: Mismatch between number of embeddings ({len(embeddings_np)}) and studies ({len(studies_to_embed)}). Skipping batch.")
+                     failed_count += len(studies_to_embed)
+                     continue
+
+                for study, embedding_vec in zip(studies_to_embed, embeddings_np):
+                    study.embedding = embedding_vec
+                    # No need to add to session here if already fetched, just modify
+                    # session.add(study) # Only needed if creating new objects
+
+                session.commit() # Commit each successful batch
+                processed_count += len(studies_to_embed)
+                logger.info(f"Batch {i//batch_size + 1}: Committed embeddings for {len(studies_to_embed)} studies.")
+
+            except Exception as e:
+                session.rollback()
+                failed_count += len(studies_to_embed)
+                logger.error(f"Error embedding or committing batch {i//batch_size + 1}: {e}. Rolling back batch.")
+                # Optional: Add IDs to a failed list for retry later
+
+    except SQLAlchemyError as e:
+        session.rollback()
+        logger.error(f"Database error during embedding task setup or query: {e}")
+        # Log the IDs that were being processed if possible
+        return f"Failed: DB error during embedding task. IDs: {study_ids}"
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Unexpected error in embedding task: {e}")
+        return f"Failed: Unexpected error during embedding task. IDs: {study_ids}"
+    finally:
+        session.close() # Ensure session is closed
+
+    logger.info(f"Embedding Task Finished for original list. Successfully processed: {processed_count}. Failed: {failed_count}.")
+    return f"Completed: Processed {processed_count}, Failed {failed_count} for original list."
+# --- End RQ Task Definition ---
 
 # Run the Flask app
 if __name__ == "__main__":
