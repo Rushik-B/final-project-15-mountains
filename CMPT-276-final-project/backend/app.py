@@ -12,6 +12,8 @@ import logging
 import datetime
 import re  # Add this at the top with other imports
 import socket  # For DNS resolution test
+import numpy as np # Add numpy import back
+import math # For log scaling
 
 # Set Tokenizer Parallelism to avoid fork issues (can be 'true' or 'false')
 # Setting to 'false' is often safer in web server environments
@@ -26,9 +28,13 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, Float, Date
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import SQLAlchemyError
 from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
 # --- End New Imports ---
+# --- New pgvector Import ---
+from pgvector.sqlalchemy import Vector
+# --- End pgvector Import ---
+# --- Import for UniqueViolation ---
+from psycopg2 import errors
+# --- End Import ---
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -51,10 +57,30 @@ app.config.update(
     DATABASE_URL=os.getenv('DATABASE_URL', 'postgresql://postgres:password@localhost:5432/postgres'),
     EMBEDDING_MODEL=os.getenv('EMBEDDING_MODEL', 'all-MiniLM-L6-v2'),
     MAX_EVIDENCE_TO_RETRIEVE=int(os.getenv('MAX_EVIDENCE_TO_RETRIEVE', '200')), # Increased from 20 to 200 per source
-    MAX_EVIDENCE_TO_STORE=int(os.getenv('MAX_EVIDENCE_TO_STORE', '400')), # Increased from 50 to 400 total
+    MAX_EVIDENCE_TO_STORE=int(os.getenv('MAX_EVIDENCE_TO_STORE', '800')), # Increased default from 400 to 800 total
     RAG_TOP_K=int(os.getenv('RAG_TOP_K', '20')), # Number of chunks for RAG analysis
 
 )
+
+# --- Initialize Embedding Model ---
+# Load the embedding model once at application start
+# This needs to happen before the Study model definition which uses embedding_dimension.
+embedding_model_name = app.config['EMBEDDING_MODEL']
+embedding_model = None
+embedding_dimension = 384 # Default dimension for MiniLM-L6-v2, fallback if model load fails
+try:
+    logger.info(f"Loading sentence transformer model: {embedding_model_name}")
+    embedding_model = SentenceTransformer(embedding_model_name)
+    # Determine dimension dynamically
+    dummy_embedding = embedding_model.encode(["test"])
+    embedding_dimension = dummy_embedding.shape[1]
+    logger.info(f"Successfully loaded embedding model with dimension {embedding_dimension}")
+except Exception as e:
+    logger.error(f"CRITICAL: Failed to initialize Sentence Transformer model: {e}")
+    logger.warning(f"Proceeding with default embedding dimension {embedding_dimension}. Vector search may be inaccurate or fail if this doesn't match the model.")
+    # Keep embedding_model = None, checks later in the code will handle this.
+
+# --- End Initialize Embedding Model ---
 
 # Initialize Gemini API
 gemini_api_key = app.config.get('GOOGLE_API_KEY')
@@ -138,11 +164,25 @@ class Study(Base):
     source_api = Column(String) # 'crossref' or 'openalex'
     retrieved_at = Column(Date, default=datetime.date.today)
     citation_count = Column(Integer, nullable=True, default=0) # Add citation count column
+    # --- Add pgvector column ---
+    # The dimension must match the embedding model output
+    embedding = Column(Vector(embedding_dimension), nullable=True)
+    # --- End Add pgvector column ---
     # relevance_score = Column(Float, nullable=True) # Add if calculated
 
 # Create tables if they don't exist (better to use Alembic migrations)
 logger.info("Creating database tables if they don't exist...")
 try:
+    # Make sure the vector extension is available before creating tables
+    with engine.connect() as conn:
+        try:
+             logger.info("Checking if vector extension is enabled...")
+             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+             conn.commit()
+             logger.info("Vector extension check complete.")
+        except Exception as ext_e:
+             logger.warning(f"Could not automatically enable pgvector extension: {ext_e}. Please ensure it is enabled manually in your Supabase dashboard.")
+
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables created successfully!")
 except Exception as e:
@@ -153,31 +193,87 @@ except Exception as e:
 def add_column_if_not_exists():
     try:
         # Get a connection and detect database type
+        # This function is now simplified as create_all handles column additions
+        # if the model definition changes. We'll primarily use it for the index.
+        # We assume PostgreSQL with pgvector. If SQLite is needed, this requires more complex logic.
         with engine.connect() as conn:
-            dialect = engine.dialect.name
-            logger.info(f"Database dialect detected: {dialect}")
-            
-            if dialect == 'sqlite':
-                # SQLite specific schema check
-                result = conn.execute(text("PRAGMA table_info(studies)"))
-                columns = [row[1] for row in result]
-                if 'citation_count' not in columns:
-                    logger.info("Adding citation_count column to studies table (SQLite)")
-                    conn.execute(text("ALTER TABLE studies ADD COLUMN citation_count INTEGER DEFAULT 0"))
-                    conn.commit()
-            elif dialect == 'postgresql':
-                # PostgreSQL specific schema check
-                try:
-                    # Check if the column exists in PostgreSQL
-                    conn.execute(text("SELECT citation_count FROM studies LIMIT 0"))
-                    logger.info("Citation_count column already exists in studies table (PostgreSQL)")
-                except Exception:
-                    logger.info("Adding citation_count column to studies table (PostgreSQL)")
-                    conn.execute(text("ALTER TABLE studies ADD COLUMN IF NOT EXISTS citation_count INTEGER DEFAULT 0"))
-                    conn.commit()
-            logger.info("Database schema check complete")
+             dialect = engine.dialect.name
+             logger.info(f"Database dialect detected: {dialect}")
+             if dialect == 'postgresql':
+                 logger.info("Checking/Adding columns and vector index for PostgreSQL...")
+                 # Check/Add citation_count (SQLAlchemy's create_all should handle this, but belt-and-suspenders)
+                 try:
+                     conn.execute(text("ALTER TABLE studies ADD COLUMN IF NOT EXISTS citation_count INTEGER DEFAULT 0"))
+                     conn.commit() # Commit after ALTER TABLE
+                     logger.info("Checked/Added citation_count column.")
+                 except Exception as e:
+                     logger.warning(f"Could not add citation_count column (might already exist or other issue): {e}")
+                     conn.rollback()
+
+                 # Explicitly check and add the embedding column if it doesn't exist
+                 # Check if the embedding column exists using information_schema
+                 column_check_query = text("""
+                     SELECT EXISTS (
+                         SELECT 1
+                         FROM information_schema.columns
+                         WHERE table_schema = 'public' -- Adjust if using a different schema
+                         AND table_name = 'studies'
+                         AND column_name = 'embedding'
+                     );
+                 """)
+                 embedding_column_exists = conn.execute(column_check_query).scalar()
+
+                 if not embedding_column_exists:
+                    logger.info("'embedding' column not found via information_schema. Attempting to add it...")
+                    try:
+                        # Ensure vector extension is available
+                        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                        # Add the column with the correct dimension
+                        conn.execute(text(f"ALTER TABLE studies ADD COLUMN embedding vector({embedding_dimension})"))
+                        conn.commit() # Commit after ALTER TABLE
+                        logger.info(f"Successfully added 'embedding' column with dimension {embedding_dimension}.")
+                    except Exception as add_col_e:
+                        logger.error(f"Failed to add 'embedding' column: {add_col_e}")
+                        conn.rollback()
+                 else:
+                     logger.info("'embedding' column already exists (checked via information_schema).")
+
+                 # Create HNSW index for faster vector similarity search (Recommended for performance)
+                 # You can adjust 'm' and 'ef_construction' based on recall/performance needs.
+                 # Index types: https://github.com/pgvector/pgvector#indexing
+                 # Using cosine distance (<=>) as it's common for sentence embeddings.
+                 # Use L2 distance (<->) if your model/task suits it better.
+                 # Use inner product (<#>) for max inner product search.
+                 index_name = "idx_studies_embedding_cosine"
+                 index_check_query = text(f"SELECT 1 FROM pg_indexes WHERE indexname = '{index_name}'")
+                 index_exists = conn.execute(index_check_query).scalar()
+
+                 if not index_exists:
+                     logger.info(f"Creating HNSW index '{index_name}' on studies(embedding)... This may take time.")
+                     try:
+                         # Ensure vector extension is loaded in this session
+                         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                         # Create the index using cosine distance
+                         # Adjust lists_or_m based on expected data size and performance needs
+                         # For HNSW: m=16, ef_construction=64 are common starting points
+                         conn.execute(text(f"""
+                             CREATE INDEX {index_name} ON studies
+                             USING hnsw (embedding vector_cosine_ops)
+                             WITH (m = 16, ef_construction = 64)
+                         """))
+                         conn.commit() # Commit after CREATE INDEX
+                         logger.info(f"Successfully created HNSW index '{index_name}'.")
+                     except Exception as e:
+                         logger.error(f"Failed to create HNSW index '{index_name}': {e}")
+                         conn.rollback() # Rollback on error
+                 else:
+                      logger.info(f"HNSW index '{index_name}' already exists.")
+             else:
+                 logger.warning(f"Database dialect '{dialect}' detected. Automatic schema migration for vector column/index is only implemented for PostgreSQL.")
+
+        logger.info("Database schema and index check complete.")
     except Exception as e:
-        logger.error(f"Error checking or updating database schema: {e}")
+        logger.error(f"Error checking or updating database schema/index: {e}")
 
 # Perform the schema check/update
 add_column_if_not_exists()
@@ -190,285 +286,109 @@ def get_db():
         db.close()
 # --- End Database Setup ---
 
-# --- New: Vector Store Setup (In-Memory FAISS) ---
-embedding_model_name = app.config['EMBEDDING_MODEL']
-try:
-    embedding_model = SentenceTransformer(embedding_model_name)
-    # Determine embedding dimension dynamically
-    dummy_embedding = embedding_model.encode(["test"])
-    embedding_dimension = dummy_embedding.shape[1]
-    # FAISS index (consider persisting this for larger applications)
-    index = faiss.IndexFlatL2(embedding_dimension)
-    index_to_study_id_map = {} # Map FAISS index to DB study ID
-    current_index_pos = 0
-    logger.info(f"Initialized FAISS index with dimension {embedding_dimension} using model {embedding_model_name}")
-except Exception as e:
-    logger.error(f"Failed to initialize Sentence Transformer model or FAISS index: {e}")
-    embedding_model = None
-    index = None
-    embedding_dimension = 0 # Default or handle error state
-
-
+# --- New: Vector Store Service using pgvector ---
 class VectorStoreService:
-    def __init__(self, db_session, faiss_index, index_map):
+    def __init__(self, db_session):
         self.db = db_session
-        self.index = faiss_index # Global index
-        self.index_map = index_map # Global index map (FAISS index -> study_id)
-        # --- Add reverse map ---
-        # study_id -> FAISS index
-        self.study_id_to_faiss_index = {v: k for k, v in index_map.items() if v is not None}
-        # --- End Add reverse map ---
-        self.current_pos = max(index_map.keys()) + 1 if index_map else 0
-        # Add a synchronization lock to prevent concurrent batch processing
-        import threading
-        self.embedding_lock = threading.Lock()
+        # Embedding model is now handled globally or passed in
 
-    def embed_and_store(self, studies):
-        """Embeds abstracts and adds them to the GLOBAL FAISS index in batches."""
-        # This method now only updates the global index, not used for query-specific search directly
-        if not embedding_model or not self.index:
-            logger.error("Embedding model or GLOBAL FAISS index not available for storing.")
+    def add_embeddings_to_studies(self, studies_to_update):
+        """
+        Generates embeddings for studies that don't have them and updates the DB.
+        Assumes embedding_model is available in the scope or passed.
+        """
+        if not embedding_model:
+            logger.error("Embedding model not available. Cannot generate embeddings.")
+            return
+        if not studies_to_update:
+            logger.info("No studies provided to embed.")
             return
 
-        # Filter studies with abstracts
-        studies_with_abstracts = [study for study in studies if study.abstract]
-        
-        if not studies_with_abstracts:
-            logger.warning("No abstracts found in studies to add to global index.")
-            return
-            
-        total_studies = len(studies_with_abstracts)
-        logger.info(f"Preparing to embed {total_studies} abstracts for the global index...")
-        
-        # Process in batches to avoid memory issues
-        batch_size = 50  # Adjust based on memory constraints
-        total_embedded = 0
-        
-        # Use lock to prevent concurrent access to FAISS index
-        with self.embedding_lock: # Lock needed as global index is modified
-            for i in range(0, total_studies, batch_size):
-                batch = studies_with_abstracts[i:i+batch_size]
-                # Ensure studies have IDs before proceeding
-                batch = [s for s in batch if s.id is not None]
-                if not batch:
-                    logger.warning(f"Skipping empty batch or batch with no IDs at index {i}")
-                    continue
+        studies_needing_embedding = [s for s in studies_to_update if s.abstract and s.embedding is None]
 
-                batch_size_actual = len(batch)
-                
-                study_ids = [study.id for study in batch] # Need study IDs
-                chunks_to_embed = [study.abstract for study in batch] # Get abstracts
-                
+        if not studies_needing_embedding:
+            logger.info("No studies need embedding in this batch.")
+            return
+
+        logger.info(f"Generating embeddings for {len(studies_needing_embedding)} studies...")
+
+        batch_size = 100 # Can be larger as we are just encoding, not storing large index
+        embedded_count = 0
+        try:
+            for i in range(0, len(studies_needing_embedding), batch_size):
+                batch = studies_needing_embedding[i:i+batch_size]
+                abstracts = [s.abstract for s in batch]
+
                 try:
-                    logger.info(f"Embedding batch of {batch_size_actual} abstracts for global index (batch {i//batch_size + 1}/{(total_studies-1)//batch_size + 1})...")
-                    embeddings = embedding_model.encode(chunks_to_embed, show_progress_bar=False)
+                    embeddings = embedding_model.encode(abstracts, show_progress_bar=False)
                     embeddings_np = np.array(embeddings).astype('float32')
 
-                    # --- Add to global index and update maps ---
-                    start_index = self.current_pos
-                    self.index.add(embeddings_np) # Add to global index
-                    
-                    for j, study_id in enumerate(study_ids):
-                        faiss_index_pos = start_index + j
-                        self.index_map[faiss_index_pos] = study_id # Update global map
-                        # --- Update reverse map ---
-                        self.study_id_to_faiss_index[study_id] = faiss_index_pos
-                        # --- End update reverse map ---
-                    
-                    self.current_pos += batch_size_actual
-                    # --- End update maps ---
+                    # Update the embedding field for each study in the batch
+                    for study, embedding_vec in zip(batch, embeddings_np):
+                        study.embedding = embedding_vec # Assign the numpy array directly
+                        self.db.add(study) # Add to session to mark for update
 
-                    total_embedded += batch_size_actual
-                    
-                    logger.info(f"Successfully added batch to global index. Total added: {total_embedded}/{total_studies}")
-                    
+                    embedded_count += len(batch)
+                    logger.info(f"Embedded batch {i//batch_size + 1}. Total embedded: {embedded_count}")
+
                 except Exception as e:
-                    logger.error(f"Error embedding batch for global index: {e}")
-                    # Continue with the next batch rather than failing completely
-            
-        logger.info(f"Completed embedding process for global index. Total global FAISS index size: {self.index.ntotal}")
-        logger.info(f"Reverse map size: {len(self.study_id_to_faiss_index)}") # Log reverse map size
+                    logger.error(f"Error embedding batch: {e}")
+                    # Decide how to handle batch errors: skip batch, stop, etc.
+                    continue # Continue with the next batch
 
-    def retrieve_relevant_chunks(self, claim_text, top_k):
-        """Retrieves top_k relevant study abstracts based on claim similarity FROM THE GLOBAL INDEX."""
-        # This method remains for potential fallback or other uses searching the global index
-        if not embedding_model or not self.index or self.index.ntotal == 0:
-            logger.error("Embedding model, GLOBAL FAISS index not available, or index is empty.")
+            # Commit all the updates at the end
+            self.db.commit()
+            logger.info(f"Successfully generated and stored embeddings for {embedded_count} studies.")
+
+        except SQLAlchemyError as e:
+            self.db.rollback()
+            logger.error(f"Database error during embedding update commit: {e}")
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Unexpected error during embedding generation/storage: {e}")
+
+    def find_relevant_studies(self, claim_text, top_k):
+        """
+        Finds top_k relevant studies from the database using vector similarity search.
+        Returns the full Study objects.
+        """
+        if not embedding_model:
+            logger.error("Embedding model not available. Cannot perform vector search.")
             return []
 
         try:
+            # 1. Embed the claim text
             claim_embedding = embedding_model.encode([claim_text])
             claim_embedding_np = np.array(claim_embedding).astype('float32')
 
-            logger.info(f"Searching GLOBAL FAISS index (size {self.index.ntotal}) for top {top_k} chunks.")
-            # Ensure k is not greater than the number of items in the index
-            k_search = min(top_k, self.index.ntotal)
-            if k_search <= 0:
-                 logger.warning("Global index is empty or k is zero, cannot search.")
-                 return []
+            # 2. Perform vector similarity search in PostgreSQL
+            # Options for distance:
+            # - Study.embedding.cosine_distance(claim_embedding_np[0]) -> Lower is better (0=identical, 2=opposite)
+            # - Study.embedding.l2_distance(claim_embedding_np[0]) -> Lower is better (Euclidean)
+            # - Study.embedding.max_inner_product(claim_embedding_np[0]) -> Higher is better
+            # We'll use cosine distance and order ascending (most similar first)
+            logger.info(f"Searching database for top {top_k} studies using vector similarity (cosine distance)...")
+            # Use the first element of claim_embedding_np since encode returns a list of embeddings
+            relevant_studies = (
+                self.db.query(Study)
+                .filter(Study.embedding != None) # Ensure embedding exists
+                .order_by(Study.embedding.cosine_distance(claim_embedding_np[0]))
+                .limit(top_k)
+                .all()
+            )
 
-            distances, indices = self.index.search(claim_embedding_np, k_search)
-
-            if not indices.size:
-                logger.warning("Global FAISS search returned no relevant indices.")
+            if not relevant_studies:
+                logger.warning("Vector search returned no relevant studies.")
                 return []
 
-            # Get the corresponding study IDs from the global map
-            relevant_study_ids = [self.index_map[i] for i in indices[0] if i in self.index_map]
-
-            if not relevant_study_ids:
-                logger.warning("No matching study IDs found for global FAISS indices.")
-                return []
-
-            # Retrieve abstracts from the database
-            # Only select needed columns
-            relevant_studies = self.db.query(Study.id, Study.abstract).filter(Study.id.in_(relevant_study_ids)).all()
-            # Return abstracts in the order of relevance found by FAISS
-            ordered_abstracts = []
-            faiss_ordered_ids = [self.index_map[i] for i in indices[0] if i in self.index_map]
-            study_dict = {s.id: s.abstract for s in relevant_studies if s.abstract}
-            for study_id in faiss_ordered_ids:
-                 if study_id in study_dict:
-                     ordered_abstracts.append(study_dict[study_id])
-
-            logger.info(f"Retrieved {len(ordered_abstracts)} relevant abstracts from GLOBAL index.")
-            return ordered_abstracts
+            logger.info(f"Retrieved {len(relevant_studies)} relevant studies from database vector search.")
+            return relevant_studies
 
         except Exception as e:
-            logger.error(f"Error retrieving relevant chunks from GLOBAL index: {e}")
-            return []
-            
-    # --- NEW METHOD for Optimized Query-Specific Search ---
-    def search_query_studies(self, claim_text, studies_for_query, top_k):
-        """
-        Retrieves existing embeddings for the given studies from the global index,
-        builds a temporary FAISS index with them, and searches it for the top_k
-        most relevant abstracts to the claim. Avoids re-embedding.
-        """
-        if not embedding_model: # Should always be available if initialized correctly
-            logger.error("Embedding model not available. Cannot embed claim.")
-            return []
-        if not self.index or self.index.ntotal == 0:
-            logger.warning("Global FAISS index is not available or empty. Cannot retrieve vectors.")
+            logger.error(f"Error during vector search in database: {e}")
             return []
 
-        # Filter studies to index (those with abstracts and valid IDs)
-        studies_to_index = [study for study in studies_for_query if study.abstract and study.id is not None]
-
-        if not studies_to_index:
-            logger.warning("No studies with abstracts provided for query-specific search.")
-            return []
-
-        num_studies = len(studies_to_index)
-        logger.info(f"Starting query-specific search: Reconstructing embeddings for {num_studies} studies.")
-
-        reconstructed_vectors = []
-        ids_for_temp_map = []
-        abstract_map = {} # Still need this to return abstracts at the end
-
-        # 1. Reconstruct vectors from Global Index
-        missing_ids = []
-        with self.embedding_lock: # Use lock when accessing global index/maps
-             # Build lookup map for this query for efficiency if num_studies is large
-             query_study_ids = {s.id for s in studies_to_index}
-             relevant_id_to_faiss_pos = {sid: pos for sid, pos in self.study_id_to_faiss_index.items() if sid in query_study_ids}
-
-        logger.info(f"Found {len(relevant_id_to_faiss_pos)}/{num_studies} studies in the global index map.")
-
-        for study in studies_to_index:
-            study_id = study.id
-            abstract_map[study_id] = study.abstract # Populate abstract map
-
-            faiss_pos = relevant_id_to_faiss_pos.get(study_id)
-
-            if faiss_pos is not None:
-                try:
-                    # Check bounds before reconstructing
-                    if faiss_pos < self.index.ntotal:
-                        vector = self.index.reconstruct(faiss_pos)
-                        reconstructed_vectors.append(vector)
-                        ids_for_temp_map.append(study_id)
-                    else:
-                        logger.warning(f"Study ID {study_id} found in map but FAISS index {faiss_pos} is out of bounds ({self.index.ntotal}). Skipping.")
-                        missing_ids.append(study_id)
-                except Exception as e:
-                    # Catch potential runtime errors from reconstruct
-                    logger.error(f"Error reconstructing vector for study ID {study_id} at index {faiss_pos}: {e}")
-                    missing_ids.append(study_id)
-            else:
-                # This case *shouldn't* happen if embed_and_store ran correctly before this,
-                # but handle defensively.
-                logger.warning(f"Study ID {study_id} not found in global study_id_to_faiss_index map. Cannot reconstruct embedding.")
-                missing_ids.append(study_id)
-
-        if not reconstructed_vectors:
-            logger.error("Could not reconstruct any vectors for the query. Aborting search.")
-            return []
-
-        if missing_ids:
-             logger.warning(f"Could not reconstruct vectors for {len(missing_ids)} studies (IDs: {missing_ids[:10]}...). Proceeding with {len(reconstructed_vectors)} studies.")
-
-
-        logger.info(f"Successfully reconstructed {len(reconstructed_vectors)} vectors.")
-
-        try:
-            # 2. Build temporary FAISS index from reconstructed vectors
-            embeddings_np = np.array(reconstructed_vectors).astype('float32')
-
-            # Basic sanity check on dimensions (reconstructed vectors should match)
-            if embeddings_np.ndim != 2 or embeddings_np.shape[1] != embedding_dimension:
-                 logger.error(f"Reconstructed embedding dimension mismatch! Expected (?, {embedding_dimension}), got {embeddings_np.shape}")
-                 return []
-
-            # Switch back to IndexFlatL2 to avoid multiprocessing issues
-            logger.info(f"Building temporary FAISS index with {embeddings_np.shape[0]} vectors...")
-            temp_index = faiss.IndexFlatL2(embedding_dimension)
-            temp_index.add(embeddings_np)
-            logger.info(f"Built temporary FAISS index with {temp_index.ntotal} reconstructed embeddings.")
-
-            # 3. Create temporary map (temp index position -> study_id)
-            temp_index_map = {i: study_id for i, study_id in enumerate(ids_for_temp_map)}
-
-            # 4. Embed claim
-            claim_embedding = embedding_model.encode([claim_text])
-            claim_embedding_np = np.array(claim_embedding).astype('float32')
-
-            # Ensure claim embedding has correct dimensions (1, embedding_dimension)
-            if claim_embedding_np.ndim == 1 and claim_embedding_np.shape[0] == embedding_dimension:
-                claim_embedding_np = claim_embedding_np.reshape((1, embedding_dimension))
-            elif claim_embedding_np.shape != (1, embedding_dimension):
-                logger.error(f"Claim embedding dimension mismatch! Expected (1, {embedding_dimension}), got {claim_embedding_np.shape}")
-                return []
-
-            # 5. Search temporary index
-            k_search = min(top_k, temp_index.ntotal) # Ensure k is not > index size
-            if k_search <= 0:
-                logger.warning("Temporary index is empty or k is zero.")
-                return []
-
-            logger.info(f"Searching temporary index for top {k_search} matches.")
-            distances, indices = temp_index.search(claim_embedding_np, k_search)
-
-            if not indices.size:
-                logger.warning("Temporary FAISS search returned no relevant indices.")
-                return []
-
-            # 6. Map results and retrieve abstracts
-            relevant_study_ids = [temp_index_map[i] for i in indices[0] if i in temp_index_map]
-
-            # Retrieve abstracts using the abstract_map created earlier
-            ordered_abstracts = [abstract_map[study_id] for study_id in relevant_study_ids if study_id in abstract_map]
-
-            logger.info(f"Retrieved {len(ordered_abstracts)} relevant abstracts from query-specific search using reconstructed vectors.")
-            return ordered_abstracts
-
-        except Exception as e:
-            logger.error(f"Error during query-specific vector search with reconstructed vectors: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return []
-
-# --- End Vector Store Setup ---
+# --- End Vector Store Service ---
 
 def clean_abstract(text):
     """Clean JATS XML tags and other formatting from abstract text."""
@@ -516,17 +436,21 @@ class OpenAlexService:
         """Search works using keyword search."""
         # Join keywords for search query if it's a list
         search_query = keywords if isinstance(keywords, str) else " ".join(keywords)
-        
-        # OpenAlex limits to 200 results per page, enforcing a safe limit
-        per_page = min(per_page, 100)  # Cap at 100 to avoid 403 errors
-        
+
+        # Use the configured max results per source. Be mindful of potential API limits.
+        # OpenAlex official limit seems to be 200. Higher values might cause errors.
+        per_page = min(per_page, 200) # Cap at 200 based on OpenAlex docs, was 100
+
+        # Re-add filter for abstracts and citation count (lowered threshold)
+        openalex_filter = 'has_abstract:true,cited_by_count:>10' # Lowered threshold from 50 to 10
+
         params = {
             'search': search_query,
             'per-page': per_page,
-            'filter': 'has_abstract:true,cited_by_count:>50', # Ensure abstracts and >50 citations
+            'filter': openalex_filter, # Use the defined filter
             'select': 'id,doi,title,authorships,publication_date,abstract_inverted_index,primary_location,cited_by_count' # Add cited_by_count
         }
-        logger.info(f"Querying OpenAlex: {search_query} with per_page={per_page}")
+        logger.info(f"Querying OpenAlex: {search_query} with per_page={per_page}, filter='{openalex_filter}'")
         try:
             response = requests.get(
                 f"{self.BASE_URL}/works",
@@ -576,23 +500,26 @@ class OpenAlexService:
                 except Exception as e:
                     logger.warning(f"Error reconstructing abstract for OpenAlex ID {paper.get('id')}: {e}")
 
+            # Skip if abstract is empty or too short
+            if not abstract or len(abstract) < 50:
+                continue
+
             # Extract authors
             authors = ", ".join([a.get('author', {}).get('display_name', '') for a in paper.get('authorships', []) if a.get('author')])
             
             # Extract citation count
             citation_count = paper.get('cited_by_count', 0)
 
-            # Only include if citation count > 5
-            if citation_count > 50:
-                processed.append({
-                    "doi": paper.get('doi'),
-                    "title": paper.get('title', 'Untitled'),
-                    "authors": authors,
-                    "pub_date": paper.get('publication_date'),
-                    "abstract": abstract,
-                    "source_api": "openalex",
-                    "citation_count": citation_count
-                })
+            # Accept all studies with abstracts, regardless of citation count
+            processed.append({
+                "doi": paper.get('doi'),
+                "title": paper.get('title', 'Untitled'),
+                "authors": authors,
+                "pub_date": paper.get('publication_date'),
+                "abstract": abstract,
+                "source_api": "openalex",
+                "citation_count": citation_count
+            })
         return processed
 # --- End OpenAlex Service ---
 
@@ -606,23 +533,23 @@ class CrossRefService:
             logger.warning("Email not set for CrossRef, using default. Set OPENALEX_EMAIL for polite API usage.")
             self.email = 'rba137@sfu.ca' # Default if not set
         self.headers = {'User-Agent': f'Factify/1.0 (mailto:{self.email})'}
-        self.timeout = 20 # Increased timeout for larger requests
+        self.timeout = 30 # Increased timeout for potentially larger/slower requests
 
     def search_works_by_keyword(self, keywords, rows=10):
         """Search CrossRef works using keyword query."""
         # Join keywords for search query if it's a list
         search_query = keywords if isinstance(keywords, str) else " ".join(keywords)
-        
-        # Cap rows at 100 for stability and to avoid server-side rejections
-        rows = min(rows, 100)
-        
+
+        # Use the configured max results per source. CrossRef limit is 1000 but often unstable.
+        # Capping at a safer limit like 200 might be wise, adjust if needed.
+        rows = min(rows, 200) # Cap at 200, was 100. Can be increased further but test stability.
+
         params = {
-            'query.bibliographic': search_query,
+            'query': search_query,
             'rows': rows,
-            'filter': 'has-abstract:true', # Try to filter for abstracts
             'select': 'DOI,title,author,abstract,published-print,published-online,created,is-referenced-by-count'  # Added citation count field
         }
-        logger.info(f"Querying CrossRef: {search_query} with rows={rows}")
+        logger.info(f"Querying CrossRef using 'query' param: {search_query} with rows={rows} (Abstracts will be filtered post-retrieval)")
         try:
             response = requests.get(
                 f"{self.BASE_URL}/works",
@@ -663,6 +590,16 @@ class CrossRefService:
             return processed
 
         for item in results_json['message'].get('items', []):
+            # --- Filter for abstract existence AFTER retrieval ---
+            abstract = item.get('abstract', '').strip()
+            # Clean JATS XML tags from abstract
+            abstract = re.sub(r'</?jats:[^>]+>', '', abstract)
+            abstract = re.sub(r'</?[^>]+>', '', abstract)
+            
+            # Skip if abstract is empty or too short after cleaning
+            if not abstract or len(abstract) < 50:
+                continue
+
             # Extract authors
             authors_list = []
             if item.get('author'):
@@ -678,17 +615,16 @@ class CrossRefService:
             # Extract citation count
             citation_count = item.get('is-referenced-by-count', 0)
 
-            # Only include if citation count > 5
-            if citation_count > 50:
-                processed.append({
-                    "doi": item.get('DOI'),
-                    "title": ". ".join(item.get('title', ['Untitled'])),
-                    "authors": authors,
-                    "pub_date": pub_date,
-                    "abstract": item.get('abstract', '').strip().lstrip('<jats:p>').rstrip('</jats:p>'), # Basic cleaning
-                    "source_api": "crossref",
-                    "citation_count": citation_count
-                })
+            # Accept all studies with abstracts, regardless of citation count
+            processed.append({
+                "doi": item.get('DOI'),
+                "title": ". ".join(item.get('title', ['Untitled'])),
+                "authors": authors,
+                "pub_date": pub_date,
+                "abstract": abstract, # Use cleaned abstract
+                "source_api": "crossref",
+                "citation_count": citation_count
+            })
         return processed
 # --- End CrossRef Service ---
 
@@ -702,51 +638,101 @@ class SemanticScholarService:
         # If rate limits become an issue, an API key can be added.
         # https://www.semanticscholar.org/product/api#Authentication
         self.headers = {'User-Agent': f'Factify/1.0 (mailto:{app.config.get("OPENALEX_EMAIL", "rba137@sfu.ca")})'} # Reuse email for politeness
-        self.timeout = 20
+        self.timeout = 30 # Increased timeout
 
     def search_works_by_keyword(self, keywords, limit=10):
-        """Search Semantic Scholar works using keyword query."""
+        """Search Semantic Scholar works using keyword query with pagination."""
         search_query = keywords if isinstance(keywords, str) else " ".join(keywords)
-        limit = min(limit, 100) # API max limit is 100
+        # Use configured limit, but respect the API's 100-per-request limit
+        max_per_page = 100
+        total_limit = limit # User requested total limit
+        retrieved_count = 0
+        current_offset = 0
+        all_results_data = []
+        total_reported_by_api = None # Store the total number of results reported by the API
 
         # Define the fields we want to retrieve - using correct field names
         fields = 'externalIds,title,authors,year,abstract,citationCount,publicationDate,journal'
 
-        params = {
-            'query': search_query,
-            'limit': limit,
-            'fields': fields,
-            'offset': 0 # Start from the beginning
-        }
-        logger.info(f"Querying Semantic Scholar: {search_query} with limit={limit}")
-        try:
-            response = requests.get(
-                f"{self.BASE_URL}/paper/search",
-                params=params,
-                headers=self.headers,
-                timeout=self.timeout
-            )
+        logger.info(f"Querying Semantic Scholar: '{search_query}' with total limit={total_limit} (using pagination)")
 
-            # Handle rate limiting (HTTP 429)
-            if response.status_code == 429:
-                logger.warning("Semantic Scholar rate limit hit, sleeping for 2 seconds.")
-                time.sleep(2)
-                # Retry the request after waiting (previously returned None)
-                return self.search_works_by_keyword(keywords, limit)
+        while retrieved_count < total_limit:
+            # Determine how many to request in this batch
+            request_limit = min(max_per_page, total_limit - retrieved_count)
+            if request_limit <= 0:
+                 break # Should not happen, but safety check
 
-            # Handle other potential errors
-            if response.status_code >= 400:
-                logger.error(f"Semantic Scholar API request failed with status {response.status_code}: {response.text}")
-                return None
+            params = {
+                'query': search_query,
+                'limit': request_limit,
+                'fields': fields,
+                'offset': current_offset
+            }
+            logger.info(f"  - Requesting batch: limit={request_limit}, offset={current_offset}")
 
-            response.raise_for_status() # Raise HTTP errors for other codes (e.g., 5xx)
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Semantic Scholar API request failed: {e}")
-            return None
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to decode Semantic Scholar JSON response: {e}")
-            return None
+            try:
+                response = requests.get(
+                    f"{self.BASE_URL}/paper/search",
+                    params=params,
+                    headers=self.headers,
+                    timeout=self.timeout
+                )
+
+                # Handle rate limiting (HTTP 429)
+                if response.status_code == 429:
+                    logger.warning("Semantic Scholar rate limit hit, sleeping for 5 seconds.") # Longer sleep
+                    time.sleep(5)
+                    continue # Retry the same request after waiting
+
+                # Handle other potential errors
+                if response.status_code >= 400:
+                    logger.error(f"Semantic Scholar API request failed with status {response.status_code} at offset {current_offset}: {response.text}")
+                    # Decide whether to stop or continue trying next pages
+                    break # Stop pagination on error
+
+                response.raise_for_status() # Raise HTTP errors for other codes (e.g., 5xx)
+                page_data = response.json()
+
+                # Check if 'data' exists and is a list
+                if 'data' not in page_data or not isinstance(page_data['data'], list):
+                    logger.warning(f"Semantic Scholar response missing 'data' list or is not a list at offset {current_offset}.")
+                    break # Stop if data format is unexpected
+
+                # Store the total reported by the API on the first request
+                if total_reported_by_api is None:
+                    total_reported_by_api = page_data.get('total', 0)
+                    logger.info(f"  - Semantic Scholar API reports {total_reported_by_api} total potential results for the query.")
+
+                current_results = page_data['data']
+                all_results_data.extend(current_results)
+                num_in_page = len(current_results)
+                retrieved_count += num_in_page
+                current_offset += num_in_page
+
+                logger.info(f"  - Retrieved {num_in_page} results in this batch. Total retrieved: {retrieved_count}")
+
+                # Stop if the API returns fewer results than requested (means we reached the end)
+                # Or if we have retrieved all reported results
+                if num_in_page < request_limit or (total_reported_by_api is not None and retrieved_count >= total_reported_by_api):
+                    logger.info(f"  - Reached end of Semantic Scholar results (requested {request_limit}, got {num_in_page} or reached total {total_reported_by_api}).")
+                    break
+
+            except requests.exceptions.Timeout:
+                logger.error(f"Semantic Scholar API request timed out at offset {current_offset}. Stopping pagination.")
+                break
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Semantic Scholar API request failed at offset {current_offset}: {e}. Stopping pagination.")
+                break
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to decode Semantic Scholar JSON response at offset {current_offset}: {e}. Stopping pagination.")
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error during Semantic Scholar pagination at offset {current_offset}: {e}")
+                break # Stop on unexpected errors
+
+        logger.info(f"Finished Semantic Scholar pagination. Total results collected: {len(all_results_data)}")
+        # Return the aggregated results in the expected format for process_results
+        return {'data': all_results_data, 'total': len(all_results_data)} # Mimic single page structure but with all data
 
     def process_results(self, results_json):
         """Processes Semantic Scholar JSON results into a standardized format."""
@@ -761,7 +747,7 @@ class SemanticScholarService:
 
         for item in results_json.get('data', []):
             # Skip if abstract is missing or too short
-            abstract = item.get('abstract')
+            abstract = item.get('abstract', '')
             if not abstract or len(abstract) < 50:
                 continue
 
@@ -782,17 +768,16 @@ class SemanticScholarService:
             # Extract citation count
             citation_count = item.get('citationCount', 0)
 
-            # Only include if citation count > 5 (consistent with other sources)
-            if citation_count > 50:
-                processed.append({
-                    "doi": doi,
-                    "title": item.get('title', 'Untitled'),
-                    "authors": authors_str,
-                    "pub_date": pub_date,
-                    "abstract": abstract,
-                    "source_api": "semantic_scholar",
-                    "citation_count": citation_count
-                })
+            # Accept all studies with abstracts, regardless of citation count
+            processed.append({
+                "doi": doi,
+                "title": item.get('title', 'Untitled'),
+                "authors": authors_str,
+                "pub_date": pub_date,
+                "abstract": abstract,
+                "source_api": "semantic_scholar",
+                "citation_count": citation_count
+            })
         return processed
 # --- End Semantic Scholar Service ---
 
@@ -975,13 +960,14 @@ class GeminiService:
 
 # --- New RAG Verification Service ---
 class RAGVerificationService:
+    # Restore db_session and vector_store_service
     def __init__(self, gemini_service, openalex_service, crossref_service, semantic_scholar_service, db_session, vector_store_service):
         self.gemini = gemini_service
         self.openalex = openalex_service
         self.crossref = crossref_service
         self.semantic_scholar = semantic_scholar_service
-        self.db = db_session
-        self.vector_store = vector_store_service
+        self.db = db_session # RESTORED
+        self.vector_store = vector_store_service # RESTORED
 
     def process_claim_request(self, claim):
         """Orchestrates the entire RAG workflow for a claim."""
@@ -991,7 +977,6 @@ class RAGVerificationService:
         # 1. Preprocess Claim (Keywords + Category)
         preprocessing_result = self.gemini.preprocess_claim(claim)
         keywords = preprocessing_result.get("keywords", [])
-        # Use keywords as a string for API searches
         keyword_string = " ".join(keywords)
         category = preprocessing_result.get("category", "unknown")
 
@@ -1008,14 +993,11 @@ class RAGVerificationService:
         crossref_studies = []
         semantic_scholar_studies = []
 
-        # Use ThreadPoolExecutor for concurrent API calls
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            # Submit tasks
             future_openalex = executor.submit(self.openalex.search_works_by_keyword, keyword_string, per_page=max_results_per_source)
             future_crossref = executor.submit(self.crossref.search_works_by_keyword, keyword_string, rows=max_results_per_source)
             future_semantic = executor.submit(self.semantic_scholar.search_works_by_keyword, keyword_string, limit=max_results_per_source)
 
-            # Process results as they complete
             try:
                 openalex_data = future_openalex.result()
                 if openalex_data:
@@ -1043,113 +1025,100 @@ class RAGVerificationService:
         all_studies_data = openalex_studies + crossref_studies + semantic_scholar_studies
         logger.info(f"Total studies retrieved before deduplication: {len(all_studies_data)}")
 
-
-        # --- Enhanced Filtering & Deduplication ---
+        # --- Enhanced Filtering & Deduplication --- Restore original logic
         seen_dois = set()
         seen_titles = {} # For deduplicating studies without DOIs
         unique_studies_data = []
-        
-        # First pass: process studies with DOIs (preferred)
+
+        # First pass: process studies with DOIs
         for study_data in all_studies_data:
-            # Skip studies without abstracts or with very short abstracts
             if not study_data.get('abstract') or len(study_data.get('abstract', '')) < 50:
                 continue
-                
             doi = study_data.get('doi')
             if doi:
                 if doi not in seen_dois:
                     unique_studies_data.append(study_data)
                     seen_dois.add(doi)
-                    # Also track title to avoid duplicate non-DOI studies
                     title = study_data.get('title')
-                    if title:  # Check if title exists before calling lower()
+                    if title:
                         title_lower = title.lower()
                         seen_titles[title_lower] = True
-        
-        # Second pass: consider studies without DOIs based on title similarity
+
+        # Second pass: consider studies without DOIs
         for study_data in all_studies_data:
-            # Skip studies without abstracts or with very short abstracts
             if not study_data.get('abstract') or len(study_data.get('abstract', '')) < 50:
                 continue
-                
             doi = study_data.get('doi')
-            # Only process studies without DOIs
             if not doi:
                 title = study_data.get('title')
-                # Skip if title is None or empty
                 if not title:
                     continue
-                    
                 title_lower = title.lower()
-                # Skip if we've seen this title
                 if title_lower in seen_titles:
                     continue
-                    
-                # Check for high title similarity with existing titles
                 duplicate_found = False
                 for existing_title in seen_titles:
-                    # Simple title similarity check (can be enhanced with better text matching)
-                    if existing_title and (existing_title in title_lower or title_lower in existing_title):
+                     if existing_title and (existing_title in title_lower or title_lower in existing_title):
                         duplicate_found = True
                         break
-                        
                 if not duplicate_found:
                     unique_studies_data.append(study_data)
                     seen_titles[title_lower] = True
 
-        # Reset vector store's session tracking for this new query
-        # self.vector_store.current_session_indices = [] # REMOVED
-        # self.vector_store.current_session_study_ids = [] # REMOVED
+        # Limit total studies to *process* for this request (config was MAX_EVIDENCE_TO_STORE)
+        studies_to_process_data = unique_studies_data[:app.config['MAX_EVIDENCE_TO_STORE']]
+        logger.info(f"Processing up to {len(studies_to_process_data)} unique studies with abstracts for this request.")
 
-        # Limit total studies to store - already increased in config to 400
-        unique_studies_data = unique_studies_data[:app.config['MAX_EVIDENCE_TO_STORE']]
-        logger.info(f"Filtered down to {len(unique_studies_data)} unique studies with abstracts (after deduplication).")
-
-        if not unique_studies_data:
+        if not studies_to_process_data:
             logger.warning("No usable evidence found after filtering.")
+            # Continue to RAG analysis, which will handle no evidence
             return {
                 "claim": claim,
                 "verdict": "Inconclusive",
                 "reasoning": "No relevant academic studies with abstracts could be retrieved.",
+                "detailed_reasoning": "No relevant academic studies with abstracts could be retrieved.", # Added for consistency
+                "simplified_reasoning": "No relevant academic studies with abstracts could be retrieved.", # Added for consistency
+                "accuracy_score": 0.0, # Added for consistency
                 "evidence": [],
-                "processing_time_seconds": time.time() - start_time
+                "keywords_used": keywords,
+                "category": category,
+                "processing_time_seconds": round(time.time() - start_time, 2)
             }
 
-        # 3. Store Evidence in DB - optimized for larger study pools
+        # 3. Store Evidence in DB - optimized for larger study pools (Restore this section)
         stored_studies = []
         batch_size = 50  # Process in batches to avoid memory issues with very large pools
-        
+
         try:
             # Create a map of existing DOIs to avoid redundant queries
-            existing_dois = {}
-            if unique_studies_data:
-                study_dois = [s.get('doi') for s in unique_studies_data if s.get('doi')]
+            existing_dois_map = {}
+            if studies_to_process_data:
+                study_dois = [s.get('doi') for s in studies_to_process_data if s.get('doi')]
                 if study_dois:
-                    existing_studies = self.db.query(Study.doi, Study.id).filter(Study.doi.in_(study_dois)).all()
-                    existing_dois = {study.doi: study.id for study in existing_studies}
-                    logger.info(f"Found {len(existing_dois)} already existing studies in database")
-            
+                    existing_studies_in_db = self.db.query(Study).filter(Study.doi.in_(study_dois)).all()
+                    existing_dois_map = {study.doi: study for study in existing_studies_in_db}
+                    logger.info(f"Found {len(existing_dois_map)} studies from this batch already in database via DOI lookup.")
+
             # Process studies in batches
-            for i in range(0, len(unique_studies_data), batch_size):
-                batch = unique_studies_data[i:i+batch_size]
+            for i in range(0, len(studies_to_process_data), batch_size):
+                batch = studies_to_process_data[i:i+batch_size]
                 batch_objects = []
-                
+
                 for study_data in batch:
                     doi = study_data.get('doi')
-                    
+
                     # Skip if DOI exists and we already have it in the database
-                    if doi and doi in existing_dois:
-                        # Fetch the existing study if needed - inline query to avoid race conditions
-                        existing_study = self.db.query(Study).filter(Study.id == existing_dois[doi]).first()
-                        if existing_study:
-                            # Update citation count if it changed
-                            new_citation_count = study_data.get('citation_count', 0)
-                            if existing_study.citation_count != new_citation_count:
+                    if doi and doi in existing_dois_map:
+                        existing_study = existing_dois_map[doi]
+                        # Update citation count if it changed significantly
+                        new_citation_count = study_data.get('citation_count', 0)
+                        if new_citation_count > existing_study.citation_count:
+                             if (new_citation_count - existing_study.citation_count) / (existing_study.citation_count + 1e-6) > 0.1:
                                 existing_study.citation_count = new_citation_count
                                 self.db.add(existing_study)
-                            stored_studies.append(existing_study)
-                            logger.debug(f"Using existing study with DOI: {doi}")
-                            continue
+                                logger.info(f"Updating citation count for existing study DOI: {doi} to {new_citation_count}")
+                        stored_studies.append(existing_study) # Add the existing study object
+                        continue # Move to next study in batch
                     # Double-check DOI doesn't exist (in case it was added by concurrent process)
                     elif doi:
                         existing_study = self.db.query(Study).filter(Study.doi == doi).first()
@@ -1161,10 +1130,10 @@ class RAGVerificationService:
                                 self.db.add(existing_study)
                             stored_studies.append(existing_study)
                             # Add to our cache for future lookups
-                            existing_dois[doi] = existing_study.id
+                            existing_dois_map[doi] = existing_study
                             logger.debug(f"Found study with DOI: {doi} that wasn't in cache")
                             continue
-                    
+
                     # Create new study object
                     try:
                         study_obj = Study(
@@ -1174,7 +1143,8 @@ class RAGVerificationService:
                             pub_date=study_data.get('pub_date'),
                             abstract=study_data.get('abstract'),
                             source_api=study_data.get('source_api'),
-                            citation_count=study_data.get('citation_count', 0)
+                            citation_count=study_data.get('citation_count', 0),
+                            embedding=None # Initialize embedding as None
                         )
                         self.db.add(study_obj)
                         batch_objects.append(study_obj)
@@ -1182,22 +1152,22 @@ class RAGVerificationService:
                         # Log the error but continue with other studies
                         logger.warning(f"Error adding study with DOI {doi}: {e}")
                         continue
-                
+
                 # Commit batch and refresh objects to get IDs
                 try:
                     self.db.commit()
                     for study_obj in batch_objects:
                         self.db.refresh(study_obj)
                         stored_studies.append(study_obj)
-                    
-                    logger.info(f"Stored batch of {len(batch_objects)} new studies. Total stored: {len(stored_studies)}")
+
+                    logger.info(f"Committed batch. Added {len(batch_objects)} new studies to DB session.")
                 except SQLAlchemyError as e:
                     # Rollback on batch error but continue with next batch
                     self.db.rollback()
                     logger.error(f"Error committing batch: {e}")
-                    
+
                     # If we hit duplicate DOIs, try processing studies one by one
-                    if "UNIQUE constraint failed" in str(e):
+                    if isinstance(e.orig, errors.UniqueViolation):
                         logger.info("Attempting to process studies one by one to handle duplicates")
                         for study_data in batch:
                             try:
@@ -1208,7 +1178,7 @@ class RAGVerificationService:
                                     if existing:
                                         stored_studies.append(existing)
                                         continue
-                                
+
                                 # Create and add the study
                                 study_obj = Study(
                                     doi=study_data.get('doi'),
@@ -1217,17 +1187,24 @@ class RAGVerificationService:
                                     pub_date=study_data.get('pub_date'),
                                     abstract=study_data.get('abstract'),
                                     source_api=study_data.get('source_api'),
-                                    citation_count=study_data.get('citation_count', 0)
+                                    citation_count=study_data.get('citation_count', 0),
+                                    embedding=None
                                 )
                                 self.db.add(study_obj)
                                 self.db.commit()
                                 self.db.refresh(study_obj)
                                 stored_studies.append(study_obj)
                             except SQLAlchemyError as individual_error:
+                                # If the *individual* insert also fails due to duplicate, just log and continue
+                                if isinstance(individual_error.orig, errors.UniqueViolation):
+                                    logger.warning(f"Skipping individual study due to concurrent duplicate insert: {study_data.get('doi')}")
+                                else:
+                                    logger.warning(f"Error adding individual study: {individual_error}")
                                 self.db.rollback()
-                                logger.warning(f"Error adding individual study: {individual_error}")
-                    continue
-            
+                    else:
+                        # For other SQLAlchemy errors during batch commit, we might want to stop or handle differently
+                        logger.error(f"Non-duplicate error during batch commit: {e}")
+
         except SQLAlchemyError as e:
             self.db.rollback()
             logger.error(f"Database error storing evidence: {e}")
@@ -1237,40 +1214,84 @@ class RAGVerificationService:
             logger.error(f"Unexpected error storing evidence: {e}")
             return {"error": "Unexpected error storing evidence.", "status": "failed"}
 
-        # --- Vector Store Operations ---
-        # 4. Embed and Store *NEW* studies in the global Vector DB (Optional, but keeps global index up-to-date)
-        # Find studies that are truly new (not just updated) to embed
-        # Get IDs of studies already known to the global index map
-        known_global_ids = set(self.vector_store.index_map.values())
-        newly_added_studies = [s for s in stored_studies if s.id is not None and s.id not in known_global_ids]
-        if newly_added_studies:
-             logger.info(f"Embedding {len(newly_added_studies)} new studies to add to the global vector database")
-             # Pass only the new ones to embed_and_store to update the global index
-             self.vector_store.embed_and_store(newly_added_studies)
+        logger.info(f"Finished processing and storing/updating {len(stored_studies)} studies in the database for this request.")
+
+        # --- Vector Store Operations --- Restore this section
+        # 4. Generate and Store Embeddings for studies that don't have them yet
+        if stored_studies:
+            self.vector_store.add_embeddings_to_studies(stored_studies)
         else:
-            logger.info("No new studies to add to the global vector index for this query.")
+            logger.info("No studies were stored or updated, skipping embedding generation.")
+
+        # 5. Rank the studies fetched *for this request* based on combined score (Restore this section)
+        logger.info(f"Ranking {len(stored_studies)} studies based on relevance and credibility...")
+        try: # Add try-except block for claim embedding
+             claim_embedding = embedding_model.encode([claim])
+             claim_embedding_np = np.array(claim_embedding[0]).astype('float32')
+        except Exception as e:
+             logger.error(f"Error generating claim embedding: {e}")
+             # Handle error appropriately, maybe return error status
+             return {"error": "Failed to generate claim embedding for ranking.", "status": "failed"}
+
+        ranked_studies = []
+        for study in stored_studies:
+            # Calculate cosine similarity (1 - cosine_distance)
+            # pgvector cosine_distance is 1 - similarity, so lower is better.
+            # Similarity = 1 - distance. Higher similarity is better.
+            # Using numpy for calculation here as pgvector functions are in DB query
+            # Ensure embedding exists before calculating relevance
+            if study.embedding is None:
+                 logger.warning(f"Study DOI {study.doi} missing embedding, cannot calculate relevance score.")
+                 relevance_score = 0.0 # Assign a default score or skip? Assigning 0 for now.
+            else:
+                 try:
+                     study_embedding_np = np.array(study.embedding).astype('float32')
+                     # Cosine similarity formula: dot(A, B) / (norm(A) * norm(B))
+                     dot_product = np.dot(claim_embedding_np, study_embedding_np)
+                     norm_claim = np.linalg.norm(claim_embedding_np)
+                     norm_study = np.linalg.norm(study_embedding_np)
+                     if norm_claim == 0 or norm_study == 0:
+                         relevance_score = 0.0 # Avoid division by zero
+                     else:
+                          # Clamp score between 0 and 1 (or -1 and 1 depending on embeddings, often near 0-1)
+                         relevance_score = max(0.0, min(1.0, dot_product / (norm_claim * norm_study)))
+                 except Exception as e:
+                     logger.error(f"Error calculating relevance score for study {study.doi}: {e}")
+                     relevance_score = 0.0 # Assign default on error
 
 
-        # 5. Perform Efficient Query-Specific Vector Search
+            # Calculate credibility score (log-scaled citation count)
+            # Add 1 to avoid log(0). Adjust scale factor as needed.
+            credibility_score = math.log10(study.citation_count + 1)
+
+            # Combine scores (example: weighted average - adjust weights as needed)
+            relevance_weight = 0.6
+            credibility_weight = 0.4
+            combined_score = (relevance_weight * relevance_score) + (credibility_weight * credibility_score)
+
+            ranked_studies.append((study, combined_score))
+
+        # Sort studies by combined score in descending order
+        ranked_studies.sort(key=lambda item: item[1], reverse=True)
+
+        # Select top K studies for RAG analysis
         top_k = app.config['RAG_TOP_K']
-        logger.info(f"Performing optimized vector search on this query's pool of {len(stored_studies)} studies.")
-        # Call the new method that builds a temporary index and searches it
-        relevant_chunks = self.vector_store.search_query_studies(claim, stored_studies, top_k=top_k)
-        
-        # Fallback logic (Optional - keep if global search fallback is desired)
-        # Check global index size using the VectorStoreService's index attribute
-        global_index_size = self.vector_store.index.ntotal if self.vector_store.index else 0
-        if not relevant_chunks and global_index_size > top_k:
-            logger.warning("Query-specific search returned no results. Falling back to global search.")
-            relevant_chunks = self.vector_store.retrieve_relevant_chunks(claim, top_k=top_k) # Assumes retrieve_relevant_chunks still exists and searches global index
+        top_ranked_studies = [study for study, score in ranked_studies[:top_k]]
+        relevant_chunks = [study.abstract for study in top_ranked_studies if study.abstract]
 
+        # Corrected log message to use the actual top_k value
+        logger.info(f"Selected top {len(top_ranked_studies)} ranked studies (using RAG_TOP_K={top_k}) for LLM analysis.")
 
         if not relevant_chunks:
-            logger.warning("Could not retrieve any relevant chunks for analysis.")
+            logger.warning("No abstracts available from top ranked studies.")
+            # Handle case where top studies have no abstract (unlikely given filters, but possible)
             return {
                 "claim": claim,
                 "verdict": "Inconclusive",
-                "reasoning": "Could not find relevant academic evidence to analyze this claim.",
+                "reasoning": "Top ranked studies had no abstracts available for analysis.",
+                "detailed_reasoning": "Top ranked studies had no abstracts available for analysis.", # Added for consistency
+                "simplified_reasoning": "Top ranked studies had no abstracts available for analysis.", # Added for consistency
+                "accuracy_score": 0.0, # Added for consistency
                 "evidence": [],
                 "keywords_used": keywords,
                 "category": category,
@@ -1281,28 +1302,25 @@ class RAGVerificationService:
         logger.info(f"Analyzing claim with {len(relevant_chunks)} most relevant abstracts via LLM")
         analysis_result = self.gemini.analyze_with_rag(claim, relevant_chunks)
 
-        # 7. Format and Return Output
+        # 7. Format and Return Output (Restore this section)
         # Retrieve details of the *actually used* evidence chunks for the response
         evidence_details = []
-        if relevant_chunks:
-             # Find the studies corresponding to the chunks used in analysis
-             used_studies = self.db.query(Study).filter(Study.abstract.in_(relevant_chunks)).limit(top_k).all()
-             # Create a dict for quick lookup, filtering out studies with low citation counts
-             abstract_to_study = {study.abstract: study for study in used_studies if study.citation_count > 5}
-             # Get details in the order the chunks were retrieved, skipping low-citation studies
-             for chunk in relevant_chunks:
-                 study = abstract_to_study.get(chunk)
-                 if study:
-                     evidence_details.append({
-                        "title": study.title,
-                        "link": f"https://doi.org/{study.doi}" if study.doi else None,
-                        "doi": study.doi,
-                        "abstract": clean_abstract(study.abstract),
-                        "pub_date": study.pub_date,
-                        "source_api": study.source_api,
-                        "citation_count": study.citation_count
-                    })
-             logger.info(f"Filtered evidence to {len(evidence_details)} studies with more than 5 citations")
+        if top_ranked_studies:
+             # Filter based on citation count threshold AFTER retrieval
+             # We already ranked by citation count, but can apply a minimum threshold if desired
+             # For now, we'll just use the top K studies directly as they are already ranked
+             used_studies_filtered = top_ranked_studies # Use the studies selected by ranking
+             for study in used_studies_filtered:
+                 evidence_details.append({
+                    "title": study.title,
+                    "link": f"https://doi.org/{study.doi}" if study.doi else None,
+                    "doi": study.doi,
+                    "abstract": clean_abstract(study.abstract),
+                    "pub_date": study.pub_date,
+                    "source_api": study.source_api,
+                    "citation_count": study.citation_count
+                })
+             logger.info(f"Formatted evidence details for {len(used_studies_filtered)} top ranked studies.")
 
         final_response = {
             "claim": claim,
@@ -1320,16 +1338,14 @@ class RAGVerificationService:
         logger.info(f"RAG verification completed for claim: '{claim}'. Accuracy Score: {final_response['accuracy_score']}")
         return final_response
 
-# --- End RAG Verification Service ---
 
+# --- End RAG Verification Service ---
 
 # Initialize services
 openalex_service = OpenAlexService()
 crossref_service = CrossRefService()
 semantic_scholar_service = SemanticScholarService()
 gemini_service = GeminiService(gemini_model)
-
-
 
 # Routes
 @app.route('/health', methods=['GET'])
@@ -1346,7 +1362,7 @@ def health_check():
 
     gemini_status = "ok" if gemini_model else "unavailable"
     embedding_status = "ok" if embedding_model else "unavailable"
-    faiss_status = "ok" if index is not None else "unavailable"
+    vector_db_status = db_status # Tied to the main DB status now
     # Add Semantic Scholar status (can be simple 'ok' as no explicit connection needed for basic search)
     semantic_scholar_status = "ok"
 
@@ -1359,7 +1375,7 @@ def health_check():
             "database": db_status,
             "gemini_model": gemini_status,
             "embedding_model": embedding_status,
-            "vector_index": faiss_status,
+            "vector_storage": vector_db_status, # Renamed from vector_index
             "openalex_api": "ok", # Assuming ok if service initialized
             "crossref_api": "ok", # Assuming ok if service initialized
             "semantic_scholar_api": semantic_scholar_status # Add status
@@ -1373,9 +1389,9 @@ def verify_claim_rag():
     Verifies a claim using the RAG workflow:
     1. Preprocesses claim (keywords, category) via LLM.
     2. Retrieves evidence from OpenAlex & CrossRef.
-    3. Stores evidence in DB.
-    4. Embeds evidence & stores in Vector DB (FAISS).
-    5. Retrieves relevant chunks via Vector Search.
+    3. Stores/updates evidence in PostgreSQL DB.
+    4. Generates & stores embeddings in PostgreSQL (pgvector) if missing.
+    5. Retrieves relevant studies via pgvector similarity search.
     6. Analyzes claim + chunks via LLM for verdict.
     """
     data = request.get_json()
@@ -1385,18 +1401,19 @@ def verify_claim_rag():
 
     claim = data['claim']
 
-    # Get DB session and initialize services that depend on it
+    # Get DB session and initialize services that depend on it (Restore this section)
     db = next(get_db()) # Get session from generator
     try:
-        # Pass the current db session and the global FAISS index/map
-        vector_store = VectorStoreService(db, index, index_to_study_id_map)
+        # Initialize VectorStoreService with the current session
+        vector_store = VectorStoreService(db)
+        # Initialize RAG service (embedding model is now global)
         rag_service = RAGVerificationService(
             gemini_service,
             openalex_service,
             crossref_service,
             semantic_scholar_service,
-            db,
-            vector_store
+            db, # RESTORED
+            vector_store # RESTORED
         )
 
         result = rag_service.process_claim_request(claim)
@@ -1410,6 +1427,11 @@ def verify_claim_rag():
             "result": result
         }
         return jsonify(response)
+
+    except SQLAlchemyError as db_exc:
+         logger.exception(f"Database error during claim verification: {db_exc}") # Log full traceback
+         db.rollback() # Rollback on error
+         return jsonify({"status": "error", "error": "Database operation failed."}), 500
 
     except Exception as e:
         logger.exception(f"Unhandled exception during claim verification: {e}") # Log full traceback

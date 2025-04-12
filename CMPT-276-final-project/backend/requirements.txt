@@ -8,7 +8,7 @@ sqlalchemy==2.0.27
 torch>=2.0.0
 transformers>=4.34.0
 sentence-transformers==2.5.1
-faiss-cpu==1.7.4
+pgvector==0.4.0
 numpy==1.26.4
 scikit-learn==1.4.1.post1
 psycopg2-binary==2.9.9
