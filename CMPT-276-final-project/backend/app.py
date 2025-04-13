@@ -1733,6 +1733,12 @@ def verify_claim_rag():
                 "status": "failed"
             }), 500
         finally:
+            # --- Add expunge_all() here ---
+            try:
+                db.expunge_all() # Detach all objects from the session
+            except Exception as expunge_e:
+                logger.error(f"Error expunging session objects: {expunge_e}")
+            # --- End Add ---
             db.close()
             
     except Exception as e:
