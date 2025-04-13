@@ -1735,11 +1735,15 @@ def verify_claim_rag():
         finally:
             # --- Add expunge_all() here ---
             try:
+                logger.debug("Expunging objects from DB session before closing.")
                 db.expunge_all() # Detach all objects from the session
+                logger.debug("Expunged objects successfully.")
             except Exception as expunge_e:
                 logger.error(f"Error expunging session objects: {expunge_e}")
             # --- End Add ---
+            logger.debug("Closing DB session.")
             db.close()
+            logger.debug("DB session closed.")
             
     except Exception as e:
         logger.error(f"Error processing request: {e}")
