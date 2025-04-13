@@ -1131,21 +1131,22 @@ class GeminiService:
 
         Instructions:
         1.  Carefully read the claim and each evidence chunk.
-        2.  Determine how accurate the claim is based on the available scientific evidence.
-        3.  Create TWO different summaries:
-            a. First, provide a DETAILED SCIENTIFIC summary (3-5 sentences) that references specific evidence chunks. **Crucially, when referencing evidence chunk numbers (e.g., chunk 5, or chunks 5, 12, and 18), you MUST wrap the reference in the format `[EVIDENCE_CHUNK:NUMBERS]` where NUMBERS is a comma-separated list of the chunk numbers. Example: `... findings from [EVIDENCE_CHUNK:5,12,18] indicate ...` or `... as shown in [EVIDENCE_CHUNK:3] ...`. Do NOT use any other format for referencing chunks.**
-            b. Second, provide a SIMPLIFIED summary (2-3 sentences) in plain language that explains your assessment to a general audience without technical jargon or references to specific evidence chunks.
-        4.  Assign an ACCURACY SCORE between 0.0 (completely inaccurate) and 1.0 (completely accurate) to the claim. This score should reflect how well the claim is supported by the scientific evidence provided.
-        5.  If you still want to provide a categorical verdict, include it as "Supported", "Partially Supported", "Refuted", or "Inconclusive".
+        2.  **Distinguish Core Subject vs. External Factors:** When evaluating, clearly differentiate between evidence directly addressing the properties or effects of the claim's *core subject* versus evidence related to *external factors* (e.g. specific populations studied, interactions, study limitations mentioned in the evidence).
+        3.  Determine how accurate the claim is based *primarily* on the scientific evidence related to the core subject, while acknowledging the influence of external factors.
+        4.  Create TWO different summaries:
+            a. First, provide a DETAILED SCIENTIFIC summary (3-5 sentences) that references specific evidence chunks using the `[EVIDENCE_CHUNK:NUMBERS]` format (e.g., `[EVIDENCE_CHUNK:5,12,18]`). **Crucially, if applicable, explicitly mention the distinction identified in step 2.** For instance, state if the evidence supports/refutes the core subject itself, but external factors introduce caveats (or vice-versa).
+            b. Second, provide a SIMPLIFIED summary (2-3 sentences) in plain language. **This summary should also reflect the core subject vs. external factor distinction clearly** but without technical jargon or specific chunk references. Explain the main conclusion about the core subject and mention any important caveats from external factors.
+        5.  Assign an ACCURACY SCORE between 0.0 (completely inaccurate based on core subject evidence) and 1.0 (completely accurate based on core subject evidence). This score should reflect how well the claim about the *core subject* is supported, considering the nuances. Explain *how* external factors modify the interpretation in the detailed reasoning.
+        6.  If you still want to provide a categorical verdict, include it as "Supported", "Partially Supported", "Refuted", or "Inconclusive".
 
         Return ONLY a JSON object with the keys "verdict", "detailed_reasoning", "simplified_reasoning", and "accuracy_score". Do not include any other text, markdown formatting, or explanations outside the JSON structure.
 
         Example Output:
         {{
             "verdict": "Partially Supported",
-            "detailed_reasoning": "Evidence [EVIDENCE_CHUNK:3,7,12] suggests potential health benefits under specific conditions, while [EVIDENCE_CHUNK:5,9,15] indicate possible limitations. Methodological considerations noted in [EVIDENCE_CHUNK:2,8,14] and the need for more controlled trials are emphasized. The research provides moderate support for the claim, but with notable limitations ([EVIDENCE_CHUNK:4,11]).",
-            "simplified_reasoning": "The research provides some support for this claim, but with important limitations. Some studies show potential benefits, while others highlight concerns. Scientists agree that the claim is partially accurate but more research is needed.",
-            "accuracy_score": 0.6
+            "detailed_reasoning": "Evidence suggests whey protein itself can aid muscle synthesis [EVIDENCE_CHUNK:3,7]. However, significant concerns are raised regarding supplement contamination [EVIDENCE_CHUNK:2,18,50] and potential adverse interactions [EVIDENCE_CHUNK:62], which are external factors not inherent to pure whey protein. Benefits may also be population-specific [EVIDENCE_CHUNK:11,17]. While whey shows promise, the risks associated with commercial supplements complicate a simple 'good'/'bad' assessment.",
+            "simplified_reasoning": "Research indicates whey protein itself may have benefits for muscle growth. However, be cautious as whey supplements can sometimes be contaminated or interact negatively with other substances. Professional guidance is recommended before use.",
+            "accuracy_score": 0.65
         }}
 
         Now, analyze the claim and evidence provided above.
